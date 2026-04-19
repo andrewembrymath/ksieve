@@ -140,8 +140,12 @@ RSA-style generation draws balanced random primes with no `p mod 6` constraint. 
 With uniformly random primes the (1, 1) case arises roughly 25% of the time. The benchmark prints the actual rejection count before the trial table — for example:
 
 ```
-[RSA mode] generated 10 usable semiprimes; rejected 3 draws where both primes ≡ 1 mod 6 (23.1% of 13 total draws)
+[RSA mode] generated 10 usable semiprimes; rejected 3 draws where both primes ≡ 1 mod 6 (23.1% of 13 total draws; theoretical expectation ~25% for uniform random primes)
 ```
+
+The observed rate converges to 25% with larger samples; single-digit benchmarks can show rates anywhere in the 5-55% range from statistical noise.
+
+**Priority-override behavior.** `KSIEVE_RSA=1` takes precedence over `KSIEVE_SSIEVE=1` and `KSIEVE_MSIEVE=1`. This is deliberate: RSA generation produces a mix of N ≡ 1 and N ≡ 5 (mod 6) values, and forcing a single sieve across all of them causes silent correctness failures on the mismatched half. If you set both `KSIEVE_RSA=1` and an explicit sieve flag, a one-line warning prints to stderr and the explicit flag is ignored.
 
 Factor difference is constrained to `|u - v| > 2^(bits/4)`, matching standard RSA keygen guidance and keeping trivial Fermat factorization from solving the instance.
 

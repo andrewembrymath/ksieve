@@ -2737,14 +2737,13 @@ Res ksieve_factor(const mpz_t N, mpz_t uo, mpz_t vo, int verbose) {
 
     res.N_bits = (int)mpz_sizeinbase(N, 2);
 
-    /* ── Mode selection ─────────────────────────────────────────────────
+    /* ── Mode selection (in priority order) ─────────────────────────────
+     *   KSIEVE_RSA=1    → auto-select per N (for RSA-style benchmarks).
+     *                      Overrides MSIEVE/SSIEVE if both are set.
      *   KSIEVE_MSIEVE=1 → M-sieve (new form, N ≡ 5 mod 6).
      *   KSIEVE_SSIEVE=1 → S-sieve (old form, N ≡ 1 mod 6, 4.24× range).
-     *   Otherwise      → K-sieve (old form, N ≡ 1 mod 6, wide range).
-     *
-     * Auto-detect: if KSIEVE_AUTO=1 and no explicit mode set, pick based on N mod 6:
-     *   N mod 6 == 1 → S-sieve (best for old form);
-     *   N mod 6 == 5 → M-sieve (only option).
+     *   KSIEVE_AUTO=1   → auto-select per N (N mod 6 == 5 → M-sieve; else S-sieve).
+     *   (none)          → K-sieve (old form, N ≡ 1 mod 6, wide range).
      */
     enum sieve_mode mode = MODE_K_SIEVE;
     u64 S_min_l = 0;
@@ -2752,9 +2751,23 @@ Res ksieve_factor(const mpz_t N, mpz_t uo, mpz_t vo, int verbose) {
         const char *env_m = getenv("KSIEVE_MSIEVE");
         const char *env_s = getenv("KSIEVE_SSIEVE");
         const char *env_a = getenv("KSIEVE_AUTO");
+        const char *env_r = getenv("KSIEVE_RSA");
         int explicit_m = (env_m && atoi(env_m));
         int explicit_s = (env_s && atoi(env_s));
-        if (explicit_m) mode = MODE_M_SIEVE;
+        int explicit_r = (env_r && atoi(env_r));
+        /* Priority: RSA > MSIEVE > SSIEVE > AUTO > default (K-sieve).
+         *
+         * KSIEVE_RSA=1 MUST force per-N sieve selection: RSA-style generators
+         * produce a mix of N mod 6 = 1 and N mod 6 = 5 values, and using a
+         * fixed sieve for both causes silent factoring failures on half the
+         * trials. When KSIEVE_RSA=1 is set alongside MSIEVE or SSIEVE, the
+         * RSA per-N behavior takes precedence silently here; run_bench prints
+         * a single warning at startup if the combination is detected. */
+        if (explicit_r) {
+            unsigned long N_mod6 = mpz_fdiv_ui(N, 6);
+            mode = (N_mod6 == 5) ? MODE_M_SIEVE : MODE_S_SIEVE;
+        }
+        else if (explicit_m) mode = MODE_M_SIEVE;
         else if (explicit_s) mode = MODE_S_SIEVE;
         else if (env_a && atoi(env_a)) {
             unsigned long N_mod6 = mpz_fdiv_ui(N, 6);
@@ -3523,10 +3536,8 @@ static void run_bench_instr(int bits, int trials) {
         if (env_r && atoi(env_r)) gen_mode_instr = 2;
         else if (env_m && atoi(env_m)) gen_mode_instr = 1;
     }
-    if (gen_mode_instr == 2) {
-        static const char auto_var[] = "KSIEVE_AUTO=1";
-        putenv((char *)auto_var);
-    }
+    /* Note: in RSA mode, ksieve_factor auto-selects sieve per N based on the
+     * KSIEVE_RSA env var; no additional setup is needed here. */
     long n_rsa_rejected_instr = 0;
 
     for (int t = 0; t < trials; t++) {
@@ -3593,13 +3604,24 @@ static void run_bench(int bits, int trials) {
     gmp_randclear(rng);
 
     if (gen_mode == 2) {
-        /* RSA mode: force auto-sieve-selection since u mod 6 varies per trial.
-         * This is safe to do via env even though N-factoring happens later. */
-        static const char auto_var[] = "KSIEVE_AUTO=1";
-        putenv((char *)auto_var);
+        /* RSA mode: sieve mode is auto-selected per-N inside ksieve_factor() based
+         * on the KSIEVE_RSA=1 flag. Warn once (before forking child processes)
+         * if the user also set an explicit sieve flag — RSA takes precedence. */
+        const char *env_m_warn = getenv("KSIEVE_MSIEVE");
+        const char *env_s_warn = getenv("KSIEVE_SSIEVE");
+        int has_m = (env_m_warn && atoi(env_m_warn));
+        int has_s = (env_s_warn && atoi(env_s_warn));
+        if (has_m || has_s) {
+            fprintf(stderr,
+                "WARNING: KSIEVE_RSA=1 is set together with KSIEVE_%sSIEVE=1; "
+                "RSA mode overrides the explicit sieve choice and auto-selects "
+                "per N based on N mod 6.\n\n",
+                has_m ? "M" : "S");
+        }
         long total_draws = (long)trials + n_rsa_rejected_1_1;
         printf("[RSA mode] generated %d usable semiprimes; rejected %ld draws "
-               "where both primes ≡ 1 mod 6 (%.1f%% of %ld total draws)\n\n",
+               "where both primes ≡ 1 mod 6 (%.1f%% of %ld total draws; "
+               "theoretical expectation ~25%% for uniform random primes)\n\n",
                trials, n_rsa_rejected_1_1,
                total_draws > 0 ? (100.0 * n_rsa_rejected_1_1 / total_draws) : 0.0,
                total_draws);
