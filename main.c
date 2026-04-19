@@ -1436,6 +1436,12 @@ typedef struct {
     int  n_primes;
     int  n_words;                              /* ceil(J_max / 64)           */
     int  J_max;
+    /* Capped-range multi-pass scan: only process words in [w_start, w_end).
+     * When w_end >= n_words (the default), this scans the entire range.
+     * Multi-pass scheme sets these to sub-ranges for early-out on the common
+     * case where true K is small. Deterministic: every word is eventually
+     * scanned across the sequence of passes. */
+    int  w_start, w_end;
     u64  last_word_mask;                       /* mask for bits in final word */
     /* Cross-prime.
      *   cp_uses_mpz = 1 for N ≥ 127-bit (g = 9K²+N overflows u128), else 0 (u128 fast path).
@@ -1502,6 +1508,9 @@ static void fused_ctx_init(FusedCtx *ctx, const mpz_t N, const mpz_t M_mpz,
     long J_max = (M_long > 0) ? (K_max_l / M_long + 1) : 1;
     ctx->J_max   = (int)J_max;
     ctx->n_words = (int)((J_max + 63) / 64);
+    /* Default: scan entire range. Multi-pass dispatcher may override. */
+    ctx->w_start = 0;
+    ctx->w_end   = ctx->n_words;
     /* Bitset prime count: mode-aware default.
      *   K-sieve: crt_np + 2 (legacy default).
      *   S-sieve: crt_np + 3 (optimal at 90-bit; within noise of +4 at 100-bit).
@@ -2121,6 +2130,11 @@ static int fused_bitset_scan(long K0, long M_long, long K_max_l,
                              long *n_isqrt, mpz_t uo, mpz_t vo) {
     int nw = ctx->n_words;
     int np = ctx->n_primes;
+    /* Capped-range: only scan words in [w_start, w_end). Defaults to full range. */
+    int w_start = ctx->w_start;
+    int w_end   = ctx->w_end;
+    if (w_end > nw) w_end = nw;
+    if (w_start >= w_end) return 0;
 
     /* Compute initial shift for each Jacobi prime */
     int shift[BS_MAX_NP];
@@ -2141,8 +2155,16 @@ static int fused_bitset_scan(long K0, long M_long, long K_max_l,
     /* QR64 mask: same for all words (period 64 = word size) */
     u64 qr64_mask = ctx->tile_qr64[((unsigned long)K0) & 63];
 
-    /* Process one word at a time */
-    for (int w = 0; w < nw; w++) {
+    /* Advance shifts to w_start. For w_start==0 this is a no-op. */
+    for (int w = 0; w < w_start; w++) {
+        for (int qi = 0; qi < np; qi++) {
+            shift[qi] += adv[qi];
+            shift[qi] -= ctx->primes[qi] & -(shift[qi] >= ctx->primes[qi]);
+        }
+    }
+
+    /* Process one word at a time, only within [w_start, w_end) */
+    for (int w = w_start; w < w_end; w++) {
         /* Build combined mask from all Jacobi primes + QR64 */
         u64 mask = qr64_mask;
         for (int qi = 0; qi < np; qi++)
@@ -2975,18 +2997,142 @@ Res ksieve_factor(const mpz_t N, mpz_t uo, mpz_t vo, int verbose) {
             wctx[i].ncrt_local = 0;
         }
 
-        if (n_threads == 1) {
-            worker_run(&wctx[0]);
+        /* ── Capped-range multi-pass scan ──────────────────────────────────
+         * Empirical observation: at 80-130 bit, K_true (S_true, M_true) lies
+         * in the bottom 10% of [0, K_max] with ~50% probability, bottom 32%
+         * with ~75%, and bottom 100% always. Scanning the full range every
+         * time wastes work on the common case.
+         *
+         * Strategy: run multiple passes with increasing word-index caps.
+         * Each pass scans words [w_{k}, w_{k+1}), and we stop as soon as
+         * any worker finds the factor. Every word is eventually scanned
+         * across the pass sequence, so correctness is preserved.
+         *
+         * Pass split points are controlled by fractions f_k of n_words:
+         *   KSIEVE_PASS_FRACS="f_0,f_1,...,f_{K-1}"  (K+1 passes, final is 1.0)
+         *
+         * Default (if not set): 0.10, 0.32 → 3 passes (0, 10%, 32%, 100%).
+         * Legacy compatibility: if unset, KSIEVE_PASS0_FRAC and
+         * KSIEVE_PASS1_FRAC still work as single-value overrides.
+         *
+         * Set KSIEVE_SINGLEPASS=1 to force single-pass (regression testing).
+         *
+         * Example tunings to try:
+         *   KSIEVE_PASS_FRACS=0.15                      (2 passes: 0-15%, 15-100%)
+         *   KSIEVE_PASS_FRACS=0.05,0.15,0.35            (4 passes)
+         *   KSIEVE_PASS_FRACS=0.03,0.08,0.15,0.35       (5 passes)
+         */
+        const char *env_single = getenv("KSIEVE_SINGLEPASS");
+        enum { MAX_PASSES = 10 };
+        int n_passes = 0;
+        int pass_w_bounds[MAX_PASSES + 1];  /* sentinel at index n_passes */
+        if (env_single && atoi(env_single)) {
+            /* Regression mode: one pass covering everything. */
+            n_passes = 1;
+            pass_w_bounds[0] = 0;
+            pass_w_bounds[1] = fctx.n_words;
         } else {
-            for (int i = 1; i < n_threads; i++) {
-                if (pthread_create(&tids[i], NULL, worker_run, &wctx[i]) != 0) {
-                    perror("pthread_create"); exit(1);
+            /* Build fraction list from env vars. Priority:
+             *   1. KSIEVE_PASS_FRACS (comma-separated list)
+             *   2. KSIEVE_PASS0_FRAC + KSIEVE_PASS1_FRAC (legacy 3-pass)
+             *   3. Default: 0.10, 0.32
+             */
+            double fracs[MAX_PASSES];
+            int n_fracs = 0;
+            const char *env_list = getenv("KSIEVE_PASS_FRACS");
+            if (env_list && *env_list) {
+                /* Parse comma-separated list. Malformed entries are ignored. */
+                const char *p = env_list;
+                while (*p && n_fracs < MAX_PASSES) {
+                    char *end;
+                    double v = strtod(p, &end);
+                    if (end == p) break;  /* no number parsed */
+                    if (v > 0.0 && v < 1.0) fracs[n_fracs++] = v;
+                    if (*end == ',') p = end + 1;
+                    else break;
                 }
+            } else {
+                /* Legacy 2-knob defaults */
+                double frac0 = 0.10, frac1 = 0.32;
+                const char *env0 = getenv("KSIEVE_PASS0_FRAC");
+                const char *env1 = getenv("KSIEVE_PASS1_FRAC");
+                if (env0) frac0 = atof(env0);
+                if (env1) frac1 = atof(env1);
+                if (frac0 > 0.0 && frac0 < 1.0) fracs[n_fracs++] = frac0;
+                if (frac1 > frac0 && frac1 < 1.0) fracs[n_fracs++] = frac1;
             }
-            /* Main thread does work too */
-            worker_run(&wctx[0]);
-            for (int i = 1; i < n_threads; i++)
-                pthread_join(tids[i], NULL);
+            /* Sort fractions ascending (defensive against misordered input). */
+            for (int i = 1; i < n_fracs; i++) {
+                double key = fracs[i];
+                int j = i - 1;
+                while (j >= 0 && fracs[j] > key) { fracs[j+1] = fracs[j]; j--; }
+                fracs[j+1] = key;
+            }
+            /* De-duplicate adjacent entries */
+            int n_uniq = 0;
+            for (int i = 0; i < n_fracs; i++) {
+                if (n_uniq == 0 || fracs[i] > fracs[n_uniq - 1] + 1e-9)
+                    fracs[n_uniq++] = fracs[i];
+            }
+            n_fracs = n_uniq;
+
+            /* Convert fractions to word indices, de-duplicate, and build bounds. */
+            int w_cuts[MAX_PASSES];
+            int n_cuts = 0;
+            for (int i = 0; i < n_fracs; i++) {
+                int w = (int)(fctx.n_words * fracs[i]);
+                if (w < 1) w = 1;
+                if (w >= fctx.n_words) break;  /* subsequent fractions would too */
+                if (n_cuts == 0 || w > w_cuts[n_cuts - 1])
+                    w_cuts[n_cuts++] = w;
+            }
+            /* Assemble pass_w_bounds: [0, w_cuts..., n_words] */
+            pass_w_bounds[0] = 0;
+            for (int i = 0; i < n_cuts; i++) pass_w_bounds[i + 1] = w_cuts[i];
+            pass_w_bounds[n_cuts + 1] = fctx.n_words;
+            n_passes = n_cuts + 1;
+
+            /* Edge case: too few words or all cuts degenerate → single pass. */
+            if (fctx.n_words <= 2 || n_passes < 1) {
+                n_passes = 1;
+                pass_w_bounds[0] = 0;
+                pass_w_bounds[1] = fctx.n_words;
+            }
+        }
+
+        /* Optional trace of computed pass bounds for debugging */
+        if (getenv("KSIEVE_PASS_TRACE")) {
+            fprintf(stderr, "[ksieve] n_words=%d, %d pass(es):",
+                    fctx.n_words, n_passes);
+            for (int i = 0; i <= n_passes; i++)
+                fprintf(stderr, " %d", pass_w_bounds[i]);
+            fprintf(stderr, "\n");
+        }
+
+        for (int pass = 0; pass < n_passes; pass++) {
+            /* Set scan bounds on shared fctx. Safe: no workers running yet. */
+            fctx.w_start = pass_w_bounds[pass];
+            fctx.w_end   = pass_w_bounds[pass + 1];
+
+            /* Reset shared work counter so this pass re-dispatches all prefixes. */
+            atomic_store(&next_work, 0);
+
+            if (n_threads == 1) {
+                worker_run(&wctx[0]);
+            } else {
+                for (int i = 1; i < n_threads; i++) {
+                    if (pthread_create(&tids[i], NULL, worker_run, &wctx[i]) != 0) {
+                        perror("pthread_create"); exit(1);
+                    }
+                }
+                /* Main thread does work too */
+                worker_run(&wctx[0]);
+                for (int i = 1; i < n_threads; i++)
+                    pthread_join(tids[i], NULL);
+            }
+
+            /* If any worker found the factor this pass, stop. */
+            if (atomic_load(&found_flag)) break;
         }
 
         found_any = atomic_load(&found_flag);
@@ -3151,6 +3297,77 @@ static void gen_semiprime_newform(mpz_t N, mpz_t u, mpz_t v,
     }
 }
 
+/* Generate an RSA-STYLE semiprime: N = u*v where u and v are both balanced primes
+ * of bits/2 bits each, with NO constraint on their residue mod 6. Standard RSA
+ * keygen follows this pattern (modulo additional safe-prime / strong-prime
+ * requirements that are orthogonal to this algorithm's behavior).
+ *
+ * Of the three possible (u mod 6, v mod 6) combinations for primes > 3:
+ *   (5, 5)  →  N ≡ 1 (mod 6)  →  S-sieve can factor this
+ *   (1, 1)  →  N ≡ 1 (mod 6)  →  NEITHER sieve handles this (both factors ≡ 1)
+ *   (1, 5) or (5, 1)  →  N ≡ 5 (mod 6)  →  M-sieve can factor this
+ *
+ * The (1, 1) case occurs ~25% of the time with truly random primes and is
+ * not solvable by any sieve in this family. This function rejects and resamples
+ * those cases (reporting counts via *n_rejected_1_1 if non-NULL), so the
+ * generator output is always factorable by auto-mode.
+ *
+ * Also enforces |u - v| > 2^(bits/4) to keep Fermat factorization from
+ * trivially solving the instance (matches standard RSA key-gen guidance). */
+static void gen_semiprime_rsa(mpz_t N, mpz_t u, mpz_t v,
+                              int bits, gmp_randstate_t rng,
+                              long *n_rejected_1_1) {
+    int half = bits / 2;
+    mpz_t diff, min_diff;
+    mpz_inits(diff, min_diff, NULL);
+    /* Minimum factor difference: 2^(bits/4). Prevents trivial Fermat case. */
+    mpz_set_ui(min_diff, 1);
+    mpz_mul_2exp(min_diff, min_diff, bits / 4);
+
+    for (;;) {
+        /* Random prime u of ~half bits. No mod-6 constraint. */
+        mpz_urandomb(u, rng, half);
+        mpz_setbit(u, half - 1);        /* full-size */
+        mpz_setbit(u, half - 2);        /* high bit cluster, like OpenSSL keygen */
+        mpz_setbit(u, 0);               /* odd */
+        mpz_nextprime(u, u);
+        if ((int)mpz_sizeinbase(u, 2) > half) continue;  /* overflow via nextprime */
+
+        /* Random prime v of ~(bits-half) bits. No mod-6 constraint. */
+        mpz_urandomb(v, rng, bits - half);
+        mpz_setbit(v, bits - half - 1);
+        mpz_setbit(v, bits - half - 2);
+        mpz_setbit(v, 0);
+        mpz_nextprime(v, v);
+        if ((int)mpz_sizeinbase(v, 2) > bits - half) continue;
+
+        if (mpz_cmp(u, v) == 0) continue;
+        /* Ensure u < v for consistent output ordering. */
+        if (mpz_cmp(u, v) > 0) mpz_swap(u, v);
+
+        /* Reject too-close factors (RSA best practice, and makes the instance
+         * non-trivial for our sieve too). */
+        mpz_sub(diff, v, u);
+        if (mpz_cmp(diff, min_diff) < 0) continue;
+
+        /* Check N mod 6 structure. Both primes ≡ 1 (mod 6) means N ≡ 1 but
+         * neither sieve handles it; resample. */
+        unsigned long u6 = mpz_fdiv_ui(u, 6);
+        unsigned long v6 = mpz_fdiv_ui(v, 6);
+        if (u6 == 1 && v6 == 1) {
+            if (n_rejected_1_1) (*n_rejected_1_1)++;
+            continue;
+        }
+        /* (u6 == 5 && v6 == 5): N ≡ 1 (mod 6), S-sieve handles it.
+         * (u6 == 1 && v6 == 5) or (5 && 1): N ≡ 5 (mod 6), M-sieve handles it. */
+
+        mpz_mul(N, u, v);
+        int nb = (int)mpz_sizeinbase(N, 2);
+        if (nb == bits || nb == bits - 1) break;
+    }
+    mpz_clears(diff, min_diff, NULL);
+}
+
 /* ══════════════════════════════════════════════════════════════════════════
  * COMMANDS
  * ══════════════════════════════════════════════════════════════════════════ */
@@ -3299,15 +3516,23 @@ static void run_bench_instr(int bits, int trials) {
     double sum_total = 0;
     int n_ok = 0;
 
-    int gen_newform_instr = 0;
+    int gen_mode_instr = 0;  /* 0 = old-form, 1 = new-form, 2 = RSA-style */
     {
         const char *env_m = getenv("KSIEVE_MSIEVE");
-        if (env_m && atoi(env_m)) gen_newform_instr = 1;
+        const char *env_r = getenv("KSIEVE_RSA");
+        if (env_r && atoi(env_r)) gen_mode_instr = 2;
+        else if (env_m && atoi(env_m)) gen_mode_instr = 1;
     }
+    if (gen_mode_instr == 2) {
+        static const char auto_var[] = "KSIEVE_AUTO=1";
+        putenv((char *)auto_var);
+    }
+    long n_rsa_rejected_instr = 0;
 
     for (int t = 0; t < trials; t++) {
-        if (gen_newform_instr) gen_semiprime_newform(N, ug, vg, bits, rng);
-        else                   gen_semiprime(N, ug, vg, bits, rng);
+        if (gen_mode_instr == 2)      gen_semiprime_rsa(N, ug, vg, bits, rng, &n_rsa_rejected_instr);
+        else if (gen_mode_instr == 1) gen_semiprime_newform(N, ug, vg, bits, rng);
+        else                          gen_semiprime(N, ug, vg, bits, rng);
         Res r = ksieve_factor(N, u, v, 0);
         int ok = r.success && verify(N, u, v);
         if (ok) n_ok++;
@@ -3335,11 +3560,6 @@ static void run_bench(int bits, int trials) {
     printf("  Benchmark: %d-bit N, %d trials  (timeout %ds/trial)\n",
            bits, trials, timeout_s);
     printf("=============================================================\n\n");
-    printf("%-4s  %-6s  %-4s  %-10s  %-10s  %-9s  %-10s  %-10s  %s\n",
-           "#","N-bit","np","crt_ops","k0s","isqrt","p1(s)","total(s)","OK?");
-    printf("%-4s  %-6s  %-4s  %-10s  %-10s  %-9s  %-10s  %-10s  %s\n",
-           "----","------","----","----------","----------","---------",
-           "----------","----------","---");
 
     /* Generate all N values upfront so the RNG sequence is deterministic
      * regardless of fork/pipe timing.                                      */
@@ -3350,19 +3570,46 @@ static void run_bench(int bits, int trials) {
     mpz_t *Ns = malloc(trials * sizeof(mpz_t));
     mpz_t ug, vg;
     mpz_inits(ug, vg, NULL);
-    /* Honor KSIEVE_MSIEVE: generate new-form semiprimes for M-sieve benchmarks. */
-    int gen_newform = 0;
+    /* Mode selection:
+     *   KSIEVE_RSA=1    → RSA-style (balanced primes, no mod-6 constraint).
+     *                      Auto-select sieve per-N based on N mod 6.
+     *   KSIEVE_MSIEVE=1 → new-form generator (N ≡ 5 mod 6).
+     *   otherwise       → old-form generator (N ≡ 1 mod 6). */
+    int gen_mode = 0;   /* 0 = old-form, 1 = new-form, 2 = RSA-style */
     {
         const char *env_m = getenv("KSIEVE_MSIEVE");
-        if (env_m && atoi(env_m)) gen_newform = 1;
+        const char *env_r = getenv("KSIEVE_RSA");
+        if (env_r && atoi(env_r)) gen_mode = 2;
+        else if (env_m && atoi(env_m)) gen_mode = 1;
     }
+    long n_rsa_rejected_1_1 = 0;
     for (int t = 0; t < trials; t++) {
         mpz_init(Ns[t]);
-        if (gen_newform) gen_semiprime_newform(Ns[t], ug, vg, bits, rng);
-        else             gen_semiprime(Ns[t], ug, vg, bits, rng);
+        if (gen_mode == 2)      gen_semiprime_rsa(Ns[t], ug, vg, bits, rng, &n_rsa_rejected_1_1);
+        else if (gen_mode == 1) gen_semiprime_newform(Ns[t], ug, vg, bits, rng);
+        else                    gen_semiprime(Ns[t], ug, vg, bits, rng);
     }
     mpz_clears(ug, vg, NULL);
     gmp_randclear(rng);
+
+    if (gen_mode == 2) {
+        /* RSA mode: force auto-sieve-selection since u mod 6 varies per trial.
+         * This is safe to do via env even though N-factoring happens later. */
+        static const char auto_var[] = "KSIEVE_AUTO=1";
+        putenv((char *)auto_var);
+        long total_draws = (long)trials + n_rsa_rejected_1_1;
+        printf("[RSA mode] generated %d usable semiprimes; rejected %ld draws "
+               "where both primes ≡ 1 mod 6 (%.1f%% of %ld total draws)\n\n",
+               trials, n_rsa_rejected_1_1,
+               total_draws > 0 ? (100.0 * n_rsa_rejected_1_1 / total_draws) : 0.0,
+               total_draws);
+    }
+
+    printf("%-4s  %-6s  %-4s  %-10s  %-10s  %-9s  %-10s  %-10s  %s\n",
+           "#","N-bit","np","crt_ops","k0s","isqrt","p1(s)","total(s)","OK?");
+    printf("%-4s  %-6s  %-4s  %-10s  %-10s  %-9s  %-10s  %-10s  %s\n",
+           "----","------","----","----------","----------","---------",
+           "----------","----------","---");
 
     double s_tot=0, s_p1=0;
     long   s_isq=0, s_crt=0, s_k0=0;
