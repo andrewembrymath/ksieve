@@ -73,6 +73,9 @@ typedef long long           i64;
 /* ── Sieve mode ─────────────────────────────────────────────────────────
  * MODE_K_SIEVE: old form (6x-1)(6y-1)=6n+1, scan K=y-x.
  *   g_K(K) = 9K² + N = T² where T=3(x+y)-1.
+ *   Also factors the (+1,+1) class (6x+1)(6y+1)=6n+1 transparently — the same
+ *   polynomial holds with T=3(x+y)+1; factor recovery u=T-3K, v=T+3K is class-
+ *   agnostic. But no mod-3 fold, so ~4.24× slower than T-sieve on that class.
  *
  * MODE_S_SIEVE: old form (6x-1)(6y-1)=6n+1, scan S=x+y.
  *   g_S(S) = 9S² - 6S - 6n = (3K)². Range 4.24× smaller than K-sieve.
@@ -83,13 +86,31 @@ typedef long long           i64;
  *   Range same as S-sieve. NO mod-3 fold available (6xy = n+K_Δ folds to K_Δ, not M).
  *   Target: N ≡ 5 (mod 6) semiprimes (which K/S-sieve cannot factor).
  *
+ * MODE_T_SIEVE: (+1,+1) form (6x+1)(6y+1)=6n+1, scan S=x+y.
+ *   g_T(S) = 9S² + 6S - 6n = (3K)². Mirrors S-sieve with three sign flips:
+ *     - linear term +6S (vs -6S) because T_real = 3S+1 (vs 3S-1 in S-sieve)
+ *     - mod-3 fold S ≡ +n (mod 3)  (vs -n; from 6xy = n-S in this class)
+ *     - S mod 4 target at N≡3 mod 8 is 3  (vs 1 in S-sieve)
+ *     - S mod 4 target at N≡7 mod 8 is 1  (vs 3 in S-sieve)
+ *   Range width, root-modulus density (1/6 or 1/12), discriminant (36N),
+ *   and QR144 tables are IDENTICAL to S-sieve. The T-sieve reuses QR144S_*
+ *   tables directly — at true S, g_T mod 144 takes the same values as g_S mod 144.
+ *
+ * Class-by-class coverage of N = u*v with u,v primes > 3:
+ *   u ≡ v ≡ -1 (mod 6)  →  N ≡ 1 (mod 6)  →  S-sieve (fast) or K-sieve (slow)
+ *   u ≡ v ≡ +1 (mod 6)  →  N ≡ 1 (mod 6)  →  T-sieve (fast) or K-sieve (slow)
+ *   u ≢ v       (mod 6) →  N ≡ 5 (mod 6)  →  M-sieve
+ *
  * The enum replaces the earlier boolean `s_sieve` field. Old code "if (s_sieve)"
- * becomes either "if (mode != MODE_K_SIEVE)" (for sum-var behavior shared by S and M)
- * or "if (mode == MODE_M_SIEVE)" (for the new-form-specific paths). */
+ * becomes either "if (mode != MODE_K_SIEVE)" (for sum-var behavior shared by S/M/T)
+ * or "if (mode == MODE_M_SIEVE)" (for the new-form-specific paths).
+ * A helper "mode == MODE_S_SIEVE || mode == MODE_T_SIEVE" picks out the
+ * mod-3-folded old-form sum sieves, which share almost all implementation. */
 enum sieve_mode {
     MODE_K_SIEVE = 0,
     MODE_S_SIEVE = 1,
     MODE_M_SIEVE = 2,
+    MODE_T_SIEVE = 3,
 };
 
 /* ── Sieve prime table (starting at 5; 2 and 3 excluded by 6k-1 structure) */
@@ -316,7 +337,7 @@ static void sieve_build(Sieve *sv, const mpz_t N, int np, enum sieve_mode mode, 
 
     mpz_t n_val; mpz_init(n_val);
     /* For M-sieve: n = (N+1)/6 since N = 6n-1.
-     * For K/S-sieve: n = (N-1)/6 since N = 6n+1.
+     * For K/S/T-sieve: n = (N-1)/6 since N = 6n+1.
      * Keep the same variable name n_val for parallel code structure. */
     if (mode == MODE_M_SIEVE) {
         mpz_add_ui(n_val, N, 1);
@@ -363,6 +384,18 @@ static void sieve_build(Sieve *sv, const mpz_t N, int np, enum sieve_mode mode, 
                 default: sv->QR144 = QR144M_N7; break;
             }
             break;
+        case MODE_T_SIEVE:
+            /* T-sieve QR144 tables are BITWISE IDENTICAL to S-sieve tables.
+             * At true S, g_T = (3K)², and the valid (3K mod 12) values depend
+             * only on N mod 8, not on T_real's sign (T_real = 3S+1 vs 3S-1).
+             * Verified numerically: {0}, {9,81}, {36}, {9,81} for N mod 8 = 1,3,5,7. */
+            switch (sv->N_mod8) {
+                case 1:  sv->QR144 = QR144S_N1; break;
+                case 3:  sv->QR144 = QR144S_N3; break;
+                case 5:  sv->QR144 = QR144S_N5; break;
+                default: sv->QR144 = QR144S_N7; break;
+            }
+            break;
     }
 
     /* ── Root modulus ──────────────────────────────────────────────────────
@@ -371,6 +404,14 @@ static void sieve_build(Sieve *sv, const mpz_t N, int np, enum sieve_mode mode, 
      *   which follows from 6xy = n + S (so mod 3: 0 ≡ n + S).
      *   Gives p=12 (N%8 ∈ {3,7}) or p=6 (N%8 ∈ {1,5}) with nvp=1.
      *   This triples M (3× fewer K0s, 3× smaller n_words) for free.
+     * T-sieve: same structure as S-sieve but with TWO SIGN FLIPS:
+     *   (1) mod-3 fold is S ≡ +n (mod 3), from 6xy = n - S in the (+1,+1)
+     *       class (N = 36xy + 6S + 1 gives n = 6xy + S, so S ≡ n mod 3).
+     *   (2) base target for N%8 ∈ {3,7} flips: N%8=3 → S mod 4 = 3
+     *       (S-sieve has 1); N%8=7 → S mod 4 = 1 (S-sieve has 3).
+     *       N%8 ∈ {1,5}: S even (same as S-sieve).
+     *   Derivation: T_real = 3S+1 (vs S-sieve's 3S-1); N = T_real² - 9K²
+     *   evaluated mod 8 with K mod 2 free gives the target table.
      * M-sieve: mod 2 or mod 4 only. NO mod-3 fold — 6xy = n + K_Δ folds to K_Δ
      *   (which M-sieve does not scan), and M is free mod 3 (verified empirically).
      *   Root ps: N≡1,5 mod 8 → mod 2 (M odd); N≡3 → mod 4, target 2; N≡7 → mod 4, target 0. */
@@ -387,18 +428,32 @@ static void sieve_build(Sieve *sv, const mpz_t N, int np, enum sieve_mode mode, 
             sv->ps[0].vp[0]  = sv->k_parity;
             sv->ps[0].density = 0.5;
         }
-    } else if (mode == MODE_S_SIEVE) {
-        /* S-sieve with mod-3 folded: target for (S - S_min) mod (root_p).
-         * Compute S_target mod root_p from:
-         *   S ≡ S_mod_base (mod base)  where base ∈ {2, 4}
-         *   S ≡ -n        (mod 3)
-         * then ps[0].vp[0] = (S_target - S_min) mod root_p. */
+    } else if (mode == MODE_S_SIEVE || mode == MODE_T_SIEVE) {
+        /* S-sieve (u,v ≡ -1 mod 6) and T-sieve (u,v ≡ +1 mod 6):
+         * root modulus folds mod-3 → p ∈ {6,12}. Compute target for
+         * (S - S_min) mod root_p from:
+         *   S ≡ s_base_target (mod base)  where base ∈ {2, 4}
+         *   S ≡ s3            (mod 3)
+         * then ps[0].vp[0] = (S_target - S_min) mod root_p.
+         *
+         * S-sieve: s3 = -n mod 3;  T-sieve: s3 = +n mod 3.
+         * S-sieve base targets: N%8=3→1, N%8=7→3.
+         * T-sieve base targets: N%8=3→3, N%8=7→1  (flipped).
+         * N%8 ∈ {1,5}: S even, base=2, target=0  (same for both). */
         long n3 = (long)mpz_fdiv_ui(n_val, 3);         /* n mod 3 */
-        int s3 = (int)((3 - n3) % 3);                  /* S ≡ -n mod 3 */
+        int s3 = (mode == MODE_S_SIEVE)
+                 ? (int)((3 - n3) % 3)                 /* S ≡ -n mod 3 */
+                 : (int)n3;                            /* S ≡ +n mod 3 */
         int base, s_base_target;
-        if (sv->N_mod8 == 3) { base = 4; s_base_target = 1; }
-        else if (sv->N_mod8 == 7) { base = 4; s_base_target = 3; }
-        else                 { base = 2; s_base_target = 0; }  /* N%8 ∈ {1,5}: S even */
+        if (sv->N_mod8 == 3) {
+            base = 4;
+            s_base_target = (mode == MODE_S_SIEVE) ? 1 : 3;
+        } else if (sv->N_mod8 == 7) {
+            base = 4;
+            s_base_target = (mode == MODE_S_SIEVE) ? 3 : 1;
+        } else {
+            base = 2; s_base_target = 0;               /* N%8 ∈ {1,5}: S even */
+        }
 
         int root_p = base * 3;                          /* 12 or 6 */
 
@@ -508,6 +563,12 @@ static void sieve_build(Sieve *sv, const mpz_t N, int np, enum sieve_mode mode, 
                             long sk = (Sm + k) % p;
                             val = ((9LL * sk % p * sk % p + p - 6LL * sk % p + p
                                     - 6LL * np_val_p % p + p) % p + p) % p;
+                        } else if (mode == MODE_T_SIEVE) {
+                            /* g_T(S) = 9S² + 6S - 6n  (mirror S-sieve with +6S) */
+                            long Sm = S_min_l % p;
+                            long sk = (Sm + k) % p;
+                            val = ((9LL * sk % p * sk % p + 6LL * sk % p
+                                    + p - 6LL * np_val_p % p + p) % p + p) % p;
                         } else {
                             /* M-sieve: g_M(M) = 9M² - N where M = M_min + k */
                             long Mm = S_min_l % p;
@@ -574,6 +635,12 @@ static void sieve_build(Sieve *sv, const mpz_t N, int np, enum sieve_mode mode, 
                 long sk = (Sm + k) % p;
                 val = ((9LL * sk % p * sk % p + p - 6LL * sk % p + p
                         - 6LL * np_val % p + p) % p + p) % p;
+            } else if (mode == MODE_T_SIEVE) {
+                /* g_T(S_min + k) = 9(S_min+k)² + 6(S_min+k) - 6n */
+                long Sm = S_min_l % p;
+                long sk = (Sm + k) % p;
+                val = ((9LL * sk % p * sk % p + 6LL * sk % p
+                        + p - 6LL * np_val % p + p) % p + p) % p;
             } else {
                 /* M-sieve: g_M(M_min + k) = 9(M_min+k)² - N */
                 long Mm = S_min_l % p;
@@ -605,6 +672,12 @@ static void sieve_build(Sieve *sv, const mpz_t N, int np, enum sieve_mode mode, 
                         long sk2 = (S_min_l % p2 + kp) % p2;
                         v2 = ((9LL * (sk2 * sk2 % p2) % p2 + p2 - 6LL * sk2 % p2 + p2
                                - 6LL * np2 % p2 + p2) % p2 + p2) % p2;
+                    } else if (mode == MODE_T_SIEVE) {
+                        /* g_T mod p²: 9s² + 6s - 6n */
+                        long np2 = (long)mpz_fdiv_ui(n_val, (unsigned long)p2);
+                        long sk2 = (S_min_l % p2 + kp) % p2;
+                        v2 = ((9LL * (sk2 * sk2 % p2) % p2 + 6LL * sk2 % p2
+                               + p2 - 6LL * np2 % p2 + p2) % p2 + p2) % p2;
                     } else {
                         /* M-sieve mod p² */
                         long Np2m = Np2;
@@ -622,6 +695,10 @@ static void sieve_build(Sieve *sv, const mpz_t N, int np, enum sieve_mode mode, 
                             long sk3 = (S_min_l % p3 + kp3) % p3;
                             v3 = ((9LL * (sk3 * sk3 % p3) % p3 + p3 - 6LL * sk3 % p3 + p3
                                    - 6LL * np3 % p3 + p3) % p3 + p3) % p3;
+                        } else if (mode == MODE_T_SIEVE) {
+                            long sk3 = (S_min_l % p3 + kp3) % p3;
+                            v3 = ((9LL * (sk3 * sk3 % p3) % p3 + 6LL * sk3 % p3
+                                   + p3 - 6LL * np3 % p3 + p3) % p3 + p3) % p3;
                         } else {
                             long mk3 = (S_min_l % p3 + kp3) % p3;
                             v3 = ((9LL * (mk3 * mk3 % p3) % p3 + p3 - Np3 % p3) % p3 + p3) % p3;
@@ -637,6 +714,10 @@ static void sieve_build(Sieve *sv, const mpz_t N, int np, enum sieve_mode mode, 
                                 long sk4 = (S_min_l % p4 + kp4) % p4;
                                 v4 = ((9LL * (sk4 * sk4 % p4) % p4 + p4 - 6LL * sk4 % p4 + p4
                                        - 6LL * np4 % p4 + p4) % p4 + p4) % p4;
+                            } else if (mode == MODE_T_SIEVE) {
+                                long sk4 = (S_min_l % p4 + kp4) % p4;
+                                v4 = ((9LL * (sk4 * sk4 % p4) % p4 + 6LL * sk4 % p4
+                                       + p4 - 6LL * np4 % p4 + p4) % p4 + p4) % p4;
                             } else {
                                 long mk4 = (S_min_l % p4 + kp4) % p4;
                                 v4 = ((9LL * (mk4 * mk4 % p4) % p4 + p4 - Np4v % p4) % p4 + p4) % p4;
@@ -708,6 +789,7 @@ static int choose_np(int N_bits, double K_max_d, enum sieve_mode mode) {
         case MODE_K_SIEVE: M = 4.0;  break;  /* mod 4 conservative */
         case MODE_S_SIEVE: M = 12.0; break;  /* mod 12 with mod-3 fold */
         case MODE_M_SIEVE: M = 4.0;  break;  /* mod 4 conservative, no mod-3 */
+        case MODE_T_SIEVE: M = 12.0; break;  /* mod 12 with mod-3 fold (same as S-sieve) */
         default:           M = 4.0;  break;
     }
     int best_np = 4;
@@ -1523,6 +1605,7 @@ static void fused_ctx_init(FusedCtx *ctx, const mpz_t N, const mpz_t M_mpz,
     int bs_np_default;
     switch (mode) {
         case MODE_S_SIEVE: bs_np_default = crt_np + 3; break;
+        case MODE_T_SIEVE: bs_np_default = crt_np + 3; break;  /* same mod-3 fold as S */
         case MODE_M_SIEVE: bs_np_default = crt_np + 5; break;
         default:           bs_np_default = crt_np + 2; break;  /* K-sieve */
     }
@@ -1543,14 +1626,14 @@ static void fused_ctx_init(FusedCtx *ctx, const mpz_t N, const mpz_t M_mpz,
     int tail = (int)(J_max % 64);
     ctx->last_word_mask = (tail == 0) ? ~0ULL : ((1ULL << tail) - 1);
 
-    /* Precompute n mod q for S-sieve and M-sieve polynomials.
-     * S-sieve: n = (N-1)/6 (since N = 6n+1).
+    /* Precompute n mod q for S/T-sieve and M-sieve polynomials.
+     * S/T-sieve: n = (N-1)/6 (since N = 6n+1).
      * M-sieve: n = (N+1)/6 (since N = 6n-1). M-sieve doesn't use n in the
      *   polynomial g_M(M) = 9M²-N, but we still keep n_val computed for the
      *   Jacobi signal / QR144 precompute path if extended later. */
     mpz_t n_val;
     mpz_init(n_val);
-    if (mode == MODE_S_SIEVE) {
+    if (mode == MODE_S_SIEVE || mode == MODE_T_SIEVE) {
         mpz_sub_ui(n_val, N, 1);
         mpz_fdiv_q_ui(n_val, n_val, 6);
     } else if (mode == MODE_M_SIEVE) {
@@ -1572,9 +1655,10 @@ static void fused_ctx_init(FusedCtx *ctx, const mpz_t N, const mpz_t M_mpz,
 
         ctx->primes[qi] = q;
         long Nq = (long)mpz_fdiv_ui(N, (unsigned long)q);
-        long nq = (mode == MODE_S_SIEVE) ? (long)mpz_fdiv_ui(n_val, (unsigned long)q) : 0;
+        long nq = (mode == MODE_S_SIEVE || mode == MODE_T_SIEVE)
+                  ? (long)mpz_fdiv_ui(n_val, (unsigned long)q) : 0;
         ctx->Minv[qi] = modinv(Mq, q);
-        (void)nq;  /* used only in S-sieve branch below */
+        (void)nq;  /* used only in S-/T-sieve branch below */
 
         uint8_t valid_j[BS_MAX_Q + 1];
         memset(valid_j, 0, sizeof(valid_j));
@@ -1587,6 +1671,12 @@ static void fused_ctx_init(FusedCtx *ctx, const mpz_t N, const mpz_t M_mpz,
                 long sk = (Smq + k) % q;
                 val = ((9LL * sk % q * sk % q + q - 6LL * sk % q + q
                         - 6LL * nq % q + q) % q + q) % q;
+            } else if (mode == MODE_T_SIEVE) {
+                /* g_T(S_min + k) = 9(S_min+k)² + 6(S_min+k) - 6n  (mod q) */
+                long Smq = S_min_l % q;
+                long sk = (Smq + k) % q;
+                val = ((9LL * sk % q * sk % q + 6LL * sk % q
+                        + q - 6LL * nq % q + q) % q + q) % q;
             } else {
                 /* M-sieve: g_M(M_min + k) = 9(M_min+k)² - N (mod q) */
                 long Mmq = S_min_l % q;
@@ -1618,7 +1708,7 @@ static void fused_ctx_init(FusedCtx *ctx, const mpz_t N, const mpz_t M_mpz,
             0,1,0,0,1,0,0,0,0,1,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,1,0,0,0,0,0,0};
         ctx->M_mod64 = (unsigned long)mpz_fdiv_ui(M_mpz, 64);
         unsigned long Nm64 = (unsigned long)mpz_fdiv_ui(N, 64);
-        unsigned long nm64 = (mode == MODE_S_SIEVE)
+        unsigned long nm64 = (mode == MODE_S_SIEVE || mode == MODE_T_SIEVE)
                               ? (unsigned long)mpz_fdiv_ui(n_val, 64) : 0;
         unsigned long Sm64 = (unsigned long)(S_min_l & 63);
         for (int k0m = 0; k0m < 64; k0m++) {
@@ -1633,6 +1723,11 @@ static void fused_ctx_init(FusedCtx *ctx, const mpz_t N, const mpz_t M_mpz,
                     unsigned long S64 = (Sm64 + K64) & 63;
                     g64 = (9UL * S64 * S64 + 64 - (6UL * S64 & 63) + 64
                            - (6UL * nm64 & 63)) & 63;
+                } else if (mode == MODE_T_SIEVE) {
+                    /* T-sieve: g_T = 9S² + 6S - 6n (mod 64). +6S, not -6S. */
+                    unsigned long S64 = (Sm64 + K64) & 63;
+                    g64 = (9UL * S64 * S64 + (6UL * S64)
+                           + 64 - (6UL * nm64 & 63)) & 63;
                 } else {
                     /* M-sieve: g_M(M) = 9M² - N mod 64, with M = M_min + K64 */
                     unsigned long M64 = (Sm64 + K64) & 63;
@@ -1683,10 +1778,10 @@ static void fused_ctx_init(FusedCtx *ctx, const mpz_t N, const mpz_t M_mpz,
         mpz_clears(nlo, nhi, NULL);
     }
 
-    /* S-sieve cross-prime: precompute n = (N-1)/6 as u128 and n mod cp_p.
+    /* S/T-sieve cross-prime: precompute n = (N-1)/6 as u128 and n mod cp_p.
      * M-sieve: n = (N+1)/6, but the M-sieve cross-prime uses g_M = 9M²-N,
      * which doesn't need n. So we don't precompute n for M-sieve here. */
-    if (mode == MODE_S_SIEVE) {
+    if (mode == MODE_S_SIEVE || mode == MODE_T_SIEVE) {
         mpz_t nv2, nlo2, nhi2;
         mpz_inits(nv2, nlo2, nhi2, NULL);
         mpz_sub_ui(nv2, N, 1); mpz_fdiv_q_ui(nv2, nv2, 6);
@@ -1710,10 +1805,10 @@ static void fused_ctx_init(FusedCtx *ctx, const mpz_t N, const mpz_t M_mpz,
     ctx->N_mod121 = (unsigned long)mpz_fdiv_ui(N, 121);
     ctx->N_mod169 = (unsigned long)mpz_fdiv_ui(N, 169);
 
-    /* S-sieve: precompute n mod m for verify chain polynomial.
+    /* S/T-sieve: precompute n mod m for verify chain polynomial (n = (N-1)/6).
      * M-sieve: doesn't need n_mod_* in the test_K chain (polynomial is 9M²-N, no n). */
     ctx->mode = mode;
-    if (mode == MODE_S_SIEVE) {
+    if (mode == MODE_S_SIEVE || mode == MODE_T_SIEVE) {
         mpz_t nv; mpz_init(nv);
         mpz_sub_ui(nv, N, 1); mpz_fdiv_q_ui(nv, nv, 6);
         ctx->n_mod31  = (unsigned long)mpz_fdiv_ui(nv, 31);
@@ -1734,7 +1829,7 @@ static void fused_ctx_init(FusedCtx *ctx, const mpz_t N, const mpz_t M_mpz,
         ctx->n_mod121 = ctx->n_mod169 = ctx->n_mod256 = ctx->n_mod65 = 0;
         ctx->n_mod41 = ctx->n_mod27 = ctx->n_mod144 = 0;
     }
-    /* K-sieve resets S_min to 0 (K scanned from 0). S-sieve and M-sieve use
+    /* K-sieve resets S_min to 0 (K scanned from 0). S/T-sieve and M-sieve use
      * the scan variable offset from S_min_l (or M_min). */
     if (mode == MODE_K_SIEVE) ctx->S_min = 0;
 }
@@ -1765,6 +1860,15 @@ static int fused_test_K(u64 K_long, const FusedCtx *ctx, const mpz_t N,
         unsigned long _s = (unsigned long)(((S_) % (m_) + (m_)) % (m_));             \
         unsigned long _g = (9UL * (_s * _s % (m_)) % (m_)                            \
                             + (m_) - (6UL * _s) % (m_)                               \
+                            + (m_) - (6UL * (nm_)) % (m_)) % (m_);                   \
+        (tbl_)[_g]; })
+
+    /* T-sieve polynomial: g = (9s² + 6s - 6n) mod m
+     * Mirror of _G_CHK_S with +6s instead of -6s (same -6n). */
+    #define _G_CHK_T(S_, nm_, tbl_, m_) ({                                           \
+        unsigned long _s = (unsigned long)(((S_) % (m_) + (m_)) % (m_));             \
+        unsigned long _g = (9UL * (_s * _s % (m_)) % (m_)                            \
+                            + (6UL * _s) % (m_)                                      \
                             + (m_) - (6UL * (nm_)) % (m_)) % (m_);                   \
         (tbl_)[_g]; })
 
@@ -1812,6 +1916,27 @@ static int fused_test_K(u64 K_long, const FusedCtx *ctx, const mpz_t N,
         if (!_G_CHK_S(K_long, ctx->n_mod144, QR144_tab, 144)) _TESTK_REJECT_AT(qr144);
         if (!_G_CHK_S(K_long, ctx->n_mod41, QR41, 41)) _TESTK_REJECT_AT(qr41);
         if (!_G_CHK_S(K_long, ctx->n_mod27, QR27, 27)) _TESTK_REJECT_AT(qr27);
+    } else if (ctx->mode == MODE_T_SIEVE) {
+        /* --- T-sieve filter chain ---
+         * Polynomial g_T(S) = 9S² + 6S - 6n where K_long holds the actual S value.
+         * Mirror of S-sieve filter chain with _G_CHK_T (+6S instead of -6S).
+         * QR144_tab is the same QR144S_* table (bitwise identical: at true S,
+         * g_T = (3K)² takes the same mod-144 values as g_S does). */
+        { unsigned long _S256 = (unsigned long)(((K_long) % 256 + 256) % 256);
+          unsigned long _g256 = (9UL * (_S256 * _S256 % 256) % 256
+                                 + (6UL * _S256) % 256
+                                 + 256 - (6UL * ctx->n_mod256) % 256) % 256;
+          if (!QR256[_g256]) _TESTK_REJECT_AT(qr256); }
+        if (!_G_CHK_T(K_long, ctx->n_mod31, QR31, 31)) _TESTK_REJECT_AT(qr31);
+        if (!_G_CHK_T(K_long, ctx->n_mod37, QR37, 37)) _TESTK_REJECT_AT(qr37);
+        if (!_G_CHK_T(K_long, ctx->n_mod65, QR65536, 65536)) _TESTK_REJECT_AT(qr65536);
+        if (!_G_CHK_T(K_long, ctx->n_mod49, QR49, 49)) _TESTK_REJECT_AT(qr49);
+        if (!_G_CHK_T(K_long, ctx->n_mod25, QR25, 25)) _TESTK_REJECT_AT(qr25);
+        if (!_G_CHK_T(K_long, ctx->n_mod121, QR121, 121)) _TESTK_REJECT_AT(qr121);
+        if (!_G_CHK_T(K_long, ctx->n_mod169, QR169, 169)) _TESTK_REJECT_AT(qr169);
+        if (!_G_CHK_T(K_long, ctx->n_mod144, QR144_tab, 144)) _TESTK_REJECT_AT(qr144);
+        if (!_G_CHK_T(K_long, ctx->n_mod41, QR41, 41)) _TESTK_REJECT_AT(qr41);
+        if (!_G_CHK_T(K_long, ctx->n_mod27, QR27, 27)) _TESTK_REJECT_AT(qr27);
     } else {
         /* --- M-sieve filter chain ---
          * Polynomial g_M(M) = 9M² - N where K_long holds the actual M value.
@@ -1837,6 +1962,7 @@ static int fused_test_K(u64 K_long, const FusedCtx *ctx, const mpz_t N,
     }
     #undef _G_CHK_K
     #undef _G_CHK_S
+    #undef _G_CHK_T
     #undef _G_CHK_M
     #undef _TESTK_REJECT_AT
     #undef _TESTK_REJECT
@@ -1893,6 +2019,37 @@ static int fused_test_K(u64 K_long, const FusedCtx *ctx, const mpz_t N,
                 u64 nm = ctx->cp_n_mod_p;
                 u64 gm = (u64)(((u128)9*Sm%ctx->cp_p*Sm%ctx->cp_p
                                 + ctx->cp_p - (u128)6*Sm%ctx->cp_p
+                                + ctx->cp_p - (u128)6*nm%ctx->cp_p) % ctx->cp_p);
+                if ((u64)(((u128)Rm*Rm)%ctx->cp_p) != gm) {
+#ifdef INSTRUMENT
+                    g_instr.reject_cp++;
+#endif
+                    INSTR_END_VAR(testK_fail, testK); return 0;
+                }
+            } else if (ctx->mode == MODE_T_SIEVE) {
+                /* T-sieve: g_T = 9S² + 6S - 6n = (3K)². Mirror of S-sieve with
+                 * +6S instead of -6S. In-range S gives cpg > 0 (verified algebraically:
+                 * at S ≈ S_min = √N/3, 9S² + 6S - 6n ≈ 6S + 1 > 0). */
+                u64 Su = (u64)K_long;
+                u128 cpg = (u128)9 * Su * Su + (u128)6 * Su - (u128)6 * ctx->cp_n_128;
+                int bits = 0;
+                { u128 tmp = cpg; while (tmp) { bits++; tmp >>= 1; } }
+                u64 cpR = (bits <= 1) ? 1 : (u64)1 << ((bits + 1) / 2);
+                for (int i = 0; i < 20; i++) {
+                    if (cpR == 0) { cpR = 1; break; }
+                    u128 sq = (u128)cpR * cpR;
+                    u64 nxt = (u64)((sq + cpg) / (2 * (u128)cpR));
+                    if (nxt >= cpR) nxt = cpR - 1;
+                    if (nxt == cpR || nxt == cpR - 1) break;
+                    cpR = nxt;
+                }
+                while ((u128)(cpR+1)*(cpR+1) <= cpg) cpR++;
+                while ((u128)cpR*cpR > cpg) cpR--;
+                u64 Rm = cpR % ctx->cp_p;
+                u64 Sm = Su % ctx->cp_p;
+                u64 nm = ctx->cp_n_mod_p;
+                u64 gm = (u64)(((u128)9*Sm%ctx->cp_p*Sm%ctx->cp_p
+                                + (u128)6*Sm%ctx->cp_p
                                 + ctx->cp_p - (u128)6*nm%ctx->cp_p) % ctx->cp_p);
                 if ((u64)(((u128)Rm*Rm)%ctx->cp_p) != gm) {
 #ifdef INSTRUMENT
@@ -1983,6 +2140,35 @@ static int fused_test_K(u64 K_long, const FusedCtx *ctx, const mpz_t N,
 #endif
                     INSTR_END_VAR(testK_fail, testK); return 0;
                 }
+            } else if (ctx->mode == MODE_T_SIEVE) {
+                /* T-sieve: g_T = 9S² + 6S - 6n = 9S² + 6S - (N-1).
+                 * Mirror of S-sieve mpz CP with +6S instead of -6S. */
+                mpz_set_ui(Kmpz, (unsigned long)K_long);  /* Kmpz = S */
+                mpz_mul(g, Kmpz, Kmpz);                    /* g = S² */
+                mpz_mul_ui(g, g, 9);                       /* g = 9S² */
+                mpz_addmul_ui(g, Kmpz, 6);                 /* g += 6S */
+                mpz_sub(g, g, ctx->cp_N_mpz_ptr);          /* g -= N */
+                mpz_add_ui(g, g, 1);                       /* g += 1, so g -= (N-1) = 6n */
+                if (mpz_sgn(g) < 0) {
+                    /* Shouldn't happen for in-range S, but defensive check. */
+#ifdef INSTRUMENT
+                    g_instr.reject_cp++;
+#endif
+                    INSTR_END_VAR(testK_fail, testK); return 0;
+                }
+                mpz_sqrt(T, g);
+                u64 Tm = (u64)mpz_fdiv_ui(T, (unsigned long)ctx->cp_p);
+                u64 Sm = (u64)K_long % ctx->cp_p;
+                u64 nm = ctx->cp_n_mod_p;
+                u64 gm = (u64)(((u128)9*Sm%ctx->cp_p*Sm%ctx->cp_p
+                                + (u128)6*Sm%ctx->cp_p
+                                + ctx->cp_p - (u128)6*nm%ctx->cp_p) % ctx->cp_p);
+                if ((u64)(((u128)Tm*Tm)%ctx->cp_p) != gm) {
+#ifdef INSTRUMENT
+                    g_instr.reject_cp++;
+#endif
+                    INSTR_END_VAR(testK_fail, testK); return 0;
+                }
             } else {
                 /* M-sieve: g_M = 9M² - N, L = isqrt(g_M), check L² ≡ g_M (mod cp_p). */
                 mpz_set_ui(Kmpz, (unsigned long)K_long);  /* Kmpz = M */
@@ -2063,6 +2249,38 @@ static int fused_test_K(u64 K_long, const FusedCtx *ctx, const mpz_t N,
         if (ok) {
             mpz_fdiv_q_ui(K, T, 3);                 /* K = sqrt(g) / 3 */
             mpz_mul_ui(T, S, 3); mpz_sub_ui(T, T, 1); /* T_real = 3S - 1 */
+            mpz_mul_ui(threeK, K, 3);
+            mpz_sub(uo, T, threeK);
+            mpz_add(vo, T, threeK);
+            /* Verify u*v == N */
+            mpz_mul(T2, uo, vo);
+            if (mpz_cmp(T2, N) != 0) ok = 0;
+        }
+#ifdef INSTRUMENT
+        if (!ok) g_instr.reject_isqrt++;
+#endif
+        mpz_clears(S, n_mpz, g, T, T2, threeK, K, NULL);
+        INSTR_END(testK);
+        return ok;
+    } else if (ctx->mode == MODE_T_SIEVE) {
+        /* T-sieve: g_T = 9S² + 6S - 6n.  sqrt(g_T) = 3K.
+         * T_real = 3S + 1 (vs S-sieve's 3S - 1).
+         * Factor recovery mirrors S-sieve; class of factors is (+1,+1) mod 6. */
+        mpz_t S, n_mpz;
+        mpz_inits(S, n_mpz, NULL);
+        mpz_set_ui(S, K_long);
+        mpz_sub_ui(n_mpz, N, 1); mpz_fdiv_q_ui(n_mpz, n_mpz, 6);
+
+        mpz_mul(g, S, S); mpz_mul_ui(g, g, 9);     /* 9S² */
+        mpz_addmul_ui(g, S, 6);                     /* +6S (vs -6S for S-sieve) */
+        mpz_submul_ui(g, n_mpz, 6);                 /* -6n */
+
+        mpz_sqrt(T, g); mpz_mul(T2, T, T);          /* T = isqrt(g) = 3K candidate */
+        int ok = (mpz_cmp(T2, g) == 0);
+        if (ok && mpz_fdiv_ui(T, 3) != 0) ok = 0;   /* 3K must be divisible by 3 */
+        if (ok) {
+            mpz_fdiv_q_ui(K, T, 3);                  /* K = sqrt(g) / 3 */
+            mpz_mul_ui(T, S, 3); mpz_add_ui(T, T, 1); /* T_real = 3S + 1 */
             mpz_mul_ui(threeK, K, 3);
             mpz_sub(uo, T, threeK);
             mpz_add(vo, T, threeK);
@@ -2729,7 +2947,10 @@ static int collect_prefixes(const Sieve *sv, const long *inv_cache, int fnp,
 /* ══════════════════════════════════════════════════════════════════════════
  * TOP-LEVEL FACTORIZATION
  * ══════════════════════════════════════════════════════════════════════════ */
-Res ksieve_factor(const mpz_t N, mpz_t uo, mpz_t vo, int verbose) {
+/* Internal single-shot factor entry point. Runs one sieve mode end-to-end.
+ * Called by ksieve_factor, which may retry with a different mode for the
+ * AUTO / RSA cases where N mod 6 = 1 leaves factor class ambiguous. */
+Res ksieve_factor_single(const mpz_t N, mpz_t uo, mpz_t vo, int verbose) {
     Res res;
     memset(&res, 0, sizeof(res));
     double t0 = now_sec();
@@ -2739,36 +2960,53 @@ Res ksieve_factor(const mpz_t N, mpz_t uo, mpz_t vo, int verbose) {
 
     /* ── Mode selection (in priority order) ─────────────────────────────
      *   KSIEVE_RSA=1    → auto-select per N (for RSA-style benchmarks).
-     *                      Overrides MSIEVE/SSIEVE if both are set.
+     *                      Overrides MSIEVE/SSIEVE/TSIEVE if multiple are set.
      *   KSIEVE_MSIEVE=1 → M-sieve (new form, N ≡ 5 mod 6).
-     *   KSIEVE_SSIEVE=1 → S-sieve (old form, N ≡ 1 mod 6, 4.24× range).
-     *   KSIEVE_AUTO=1   → auto-select per N (N mod 6 == 5 → M-sieve; else S-sieve).
-     *   (none)          → K-sieve (old form, N ≡ 1 mod 6, wide range).
-     */
+     *   KSIEVE_SSIEVE=1 → S-sieve (old form, N ≡ 1 mod 6, u,v ≡ -1 mod 6, 4.24× range).
+     *   KSIEVE_TSIEVE=1 → T-sieve ((+1,+1) form, N ≡ 1 mod 6, u,v ≡ +1 mod 6, 4.24× range).
+     *   KSIEVE_AUTO=1   → auto-select per N:
+     *                       N mod 6 == 5 → M-sieve
+     *                       N mod 6 == 1 → S-sieve first, T-sieve fallback.
+     *   (none)          → K-sieve (old form, handles both (-1,-1) and (+1,+1)
+     *                     classes transparently at the cost of a 4.24× wider range).
+     *
+     * Note: AUTO/RSA mode for N ≡ 1 mod 6 is handled by the outer ksieve_factor
+     * wrapper, which calls this function twice (S then T) if the first fails.
+     * This single-shot entry point honors a caller-set KSIEVE_RETRY_AS_T=1
+     * override to force T-sieve on the retry pass. */
     enum sieve_mode mode = MODE_K_SIEVE;
     u64 S_min_l = 0;
     {
         const char *env_m = getenv("KSIEVE_MSIEVE");
         const char *env_s = getenv("KSIEVE_SSIEVE");
+        const char *env_t = getenv("KSIEVE_TSIEVE");
         const char *env_a = getenv("KSIEVE_AUTO");
         const char *env_r = getenv("KSIEVE_RSA");
+        const char *env_retry_t = getenv("KSIEVE_RETRY_AS_T");
         int explicit_m = (env_m && atoi(env_m));
         int explicit_s = (env_s && atoi(env_s));
+        int explicit_t = (env_t && atoi(env_t));
         int explicit_r = (env_r && atoi(env_r));
-        /* Priority: RSA > MSIEVE > SSIEVE > AUTO > default (K-sieve).
+        int retry_as_t = (env_retry_t && atoi(env_retry_t));
+        /* Priority: RSA > MSIEVE > SSIEVE > TSIEVE > AUTO > default (K-sieve).
          *
          * KSIEVE_RSA=1 MUST force per-N sieve selection: RSA-style generators
          * produce a mix of N mod 6 = 1 and N mod 6 = 5 values, and using a
          * fixed sieve for both causes silent factoring failures on half the
-         * trials. When KSIEVE_RSA=1 is set alongside MSIEVE or SSIEVE, the
+         * trials. When KSIEVE_RSA=1 is set alongside MSIEVE/SSIEVE/TSIEVE, the
          * RSA per-N behavior takes precedence silently here; run_bench prints
          * a single warning at startup if the combination is detected. */
-        if (explicit_r) {
+        if (retry_as_t) {
+            /* Caller (ksieve_factor wrapper) has requested the T-sieve retry pass. */
+            mode = MODE_T_SIEVE;
+        }
+        else if (explicit_r) {
             unsigned long N_mod6 = mpz_fdiv_ui(N, 6);
             mode = (N_mod6 == 5) ? MODE_M_SIEVE : MODE_S_SIEVE;
         }
         else if (explicit_m) mode = MODE_M_SIEVE;
         else if (explicit_s) mode = MODE_S_SIEVE;
+        else if (explicit_t) mode = MODE_T_SIEVE;
         else if (env_a && atoi(env_a)) {
             unsigned long N_mod6 = mpz_fdiv_ui(N, 6);
             mode = (N_mod6 == 5) ? MODE_M_SIEVE : MODE_S_SIEVE;
@@ -2785,7 +3023,7 @@ Res ksieve_factor(const mpz_t N, mpz_t uo, mpz_t vo, int verbose) {
         }
         if (mode != MODE_M_SIEVE && N_mod6 != 1) {
             if (verbose) fprintf(stderr,
-                "WARNING: K-sieve / S-sieve requires N ≡ 1 (mod 6); got N mod 6 = %lu. "
+                "WARNING: K/S/T-sieve require N ≡ 1 (mod 6); got N mod 6 = %lu. "
                 "Factoring will almost certainly fail.\n", N_mod6);
         }
     }
@@ -2793,6 +3031,8 @@ Res ksieve_factor(const mpz_t N, mpz_t uo, mpz_t vo, int verbose) {
     /* K-sieve: K_max = floor(sqrt(N)/3) + 1 (wide range).
      * S-sieve: [S_min, S_max] where S_min = ceil(sqrt(N)/3), S_max = sqrt(5N/4)/3.
      *   Effective range = S_max - S_min ≈ K_max / 8.5.
+     * T-sieve: same range as S-sieve (scans S = x+y, same bounds; only the
+     *   polynomial and T_real recovery differ).
      * M-sieve: [M_min, M_max] where M_min = ceil(sqrt(N)/3), M_max = sqrt(5N)/6.
      *   Same range width as S-sieve (verified algebraically).  */
     mpz_t K_max, sqrtN;
@@ -2802,8 +3042,13 @@ Res ksieve_factor(const mpz_t N, mpz_t uo, mpz_t vo, int verbose) {
     if (mode == MODE_K_SIEVE) {
         mpz_fdiv_q_ui(K_max, sqrtN, 3);
         mpz_add_ui(K_max, K_max, 1);
-    } else if (mode == MODE_S_SIEVE) {
-        /* S_min = ceil(sqrt(N) / 3) = floor(sqrt(N)/3) + 1 when sqrt(N) not div by 3 */
+    } else if (mode == MODE_S_SIEVE || mode == MODE_T_SIEVE) {
+        /* S/T-sieve: S_min = ceil(sqrt(N)/3), S_max = floor(sqrt(5N/4)/3).
+         * Range derivation in S-sieve uses |v-u| ≤ sqrt(N), giving u+v ≤ sqrt(5N),
+         * hence 6S+c ≤ sqrt(5N) where c = -2 (S-sieve, u+v = 6S-2) or +2 (T-sieve,
+         * u+v = 6S+2). The +/-2 correction is below 1 ULP of the sqrt term at every
+         * bit size we use, so the same formula S_max = sqrt(5N/4)/3 serves both
+         * (both give floor-rounded S_max within 1 of the true upper bound). */
         mpz_t S_min, S_max, fiveN4;
         mpz_inits(S_min, S_max, fiveN4, NULL);
 
@@ -2823,7 +3068,8 @@ Res ksieve_factor(const mpz_t N, mpz_t uo, mpz_t vo, int verbose) {
         mpz_add_ui(K_max, K_max, 1);
 
         if (verbose) {
-            gmp_printf("S-sieve: S_min=%Zd  S_max=%Zd  range=%Zd\n", S_min, S_max, K_max);
+            const char *lbl = (mode == MODE_S_SIEVE) ? "S-sieve" : "T-sieve";
+            gmp_printf("%s: S_min=%Zd  S_max=%Zd  range=%Zd\n", lbl, S_min, S_max, K_max);
         }
 
         mpz_clears(S_min, S_max, fiveN4, NULL);
@@ -2889,7 +3135,7 @@ Res ksieve_factor(const mpz_t N, mpz_t uo, mpz_t vo, int verbose) {
     long M_long = mpz_fits_ulong_p(M_mpz) ? (long)mpz_get_ui(M_mpz) : 0;
 
     long J_max = (M_long > 0) ? (K_max_l / M_long + 1) : 1;
-    /* S-sieve and M-sieve MUST use fused path — lean stride only supports K-sieve. */
+    /* S-, T-, and M-sieve MUST use fused path — lean stride only supports K-sieve. */
     int  use_fused = !use_native && (J_max > 1) &&
                      (mode != MODE_K_SIEVE || J_max <= (1L << 24));
 
@@ -2897,10 +3143,12 @@ Res ksieve_factor(const mpz_t N, mpz_t uo, mpz_t vo, int verbose) {
         int total_np = sv->np;
         const char *range_label =
             (mode == MODE_K_SIEVE) ? "K_max" :
-            (mode == MODE_S_SIEVE) ? "S_range" : "M_range";
+            (mode == MODE_S_SIEVE) ? "S_range" :
+            (mode == MODE_T_SIEVE) ? "S_range" : "M_range";
         const char *mode_label =
             (mode == MODE_K_SIEVE) ? "K-sieve" :
-            (mode == MODE_S_SIEVE) ? "S-sieve" : "M-sieve";
+            (mode == MODE_S_SIEVE) ? "S-sieve" :
+            (mode == MODE_T_SIEVE) ? "T-sieve" : "M-sieve";
         gmp_printf("N   = %d-bit (mode = %s)\n%s = %d-bit  (~2^%.1f)\nnp  = %d (incl. p=2)\nM   = 2^%.1f\nPath: %s\nPrime order (density): ",
                res.N_bits, mode_label, range_label,
                res.K_bits, log2(K_max_d),
@@ -3024,16 +3272,24 @@ Res ksieve_factor(const mpz_t N, mpz_t uo, mpz_t vo, int verbose) {
          * Pass split points are controlled by fractions f_k of n_words:
          *   KSIEVE_PASS_FRACS="f_0,f_1,...,f_{K-1}"  (K+1 passes, final is 1.0)
          *
-         * Default (if not set): 0.10, 0.32 → 3 passes (0, 10%, 32%, 100%).
-         * Legacy compatibility: if unset, KSIEVE_PASS0_FRAC and
-         * KSIEVE_PASS1_FRAC still work as single-value overrides.
+         * Default (if neither PASS_FRACS nor PASS0/PASS1 are set):
+         *   0.03, 0.08, 0.15, 0.35  → 5 passes (0-3%, 3-8%, 8-15%, 15-35%, 35-100%)
+         *   Rev. 8 change: was 0.10, 0.32 (3-pass) in Rev. 6-7.
+         *   The 5-pass default is faster mean at 120-bit+ on typical K_true/K_max
+         *   distributions; regresses slightly on unlucky instances where K_true
+         *   sits just above a cutoff.
+         *
+         * Legacy compatibility: if either KSIEVE_PASS0_FRAC or KSIEVE_PASS1_FRAC
+         * is set (even just one of them), the legacy 3-pass behaviour is used
+         * with the unset one defaulting to its historical value (0.10 / 0.32).
+         * This lets benchmarks against pre-Rev. 8 builds reproduce cleanly.
          *
          * Set KSIEVE_SINGLEPASS=1 to force single-pass (regression testing).
          *
          * Example tunings to try:
          *   KSIEVE_PASS_FRACS=0.15                      (2 passes: 0-15%, 15-100%)
          *   KSIEVE_PASS_FRACS=0.05,0.15,0.35            (4 passes)
-         *   KSIEVE_PASS_FRACS=0.03,0.08,0.15,0.35       (5 passes)
+         *   KSIEVE_PASS_FRACS=0.03,0.08,0.15,0.35       (5 passes, current default)
          */
         const char *env_single = getenv("KSIEVE_SINGLEPASS");
         enum { MAX_PASSES = 10 };
@@ -3065,14 +3321,26 @@ Res ksieve_factor(const mpz_t N, mpz_t uo, mpz_t vo, int verbose) {
                     else break;
                 }
             } else {
-                /* Legacy 2-knob defaults */
-                double frac0 = 0.10, frac1 = 0.32;
+                /* Legacy 2-knob path: honored only if either var is set explicitly.
+                 * Otherwise use the Rev. 8 default fracs "0.03,0.08,0.15,0.35"
+                 * (5-pass: 0-3%, 3-8%, 8-15%, 15-35%, 35-100%) which outperforms
+                 * the old 3-pass default (0.10, 0.32) at 120-bit+ on the S/T-sieve's
+                 * heavy-right-tail distribution of K_true/K_max. */
                 const char *env0 = getenv("KSIEVE_PASS0_FRAC");
                 const char *env1 = getenv("KSIEVE_PASS1_FRAC");
-                if (env0) frac0 = atof(env0);
-                if (env1) frac1 = atof(env1);
-                if (frac0 > 0.0 && frac0 < 1.0) fracs[n_fracs++] = frac0;
-                if (frac1 > frac0 && frac1 < 1.0) fracs[n_fracs++] = frac1;
+                if (env0 || env1) {
+                    /* Legacy override path for regression comparisons with older builds. */
+                    double frac0 = env0 ? atof(env0) : 0.10;
+                    double frac1 = env1 ? atof(env1) : 0.32;
+                    if (frac0 > 0.0 && frac0 < 1.0) fracs[n_fracs++] = frac0;
+                    if (frac1 > frac0 && frac1 < 1.0) fracs[n_fracs++] = frac1;
+                } else {
+                    /* Default Rev. 8: 5-pass fine-grained split. */
+                    fracs[n_fracs++] = 0.03;
+                    fracs[n_fracs++] = 0.08;
+                    fracs[n_fracs++] = 0.15;
+                    fracs[n_fracs++] = 0.35;
+                }
             }
             /* Sort fractions ascending (defensive against misordered input). */
             for (int i = 1; i < n_fracs; i++) {
@@ -3113,8 +3381,11 @@ Res ksieve_factor(const mpz_t N, mpz_t uo, mpz_t vo, int verbose) {
             }
         }
 
-        /* Optional trace of computed pass bounds for debugging */
-        if (getenv("KSIEVE_PASS_TRACE")) {
+        /* Print computed pass bounds. Fires under verbose mode (single-factor
+         * runs via `./ksieve <N>`) or if KSIEVE_PASS_TRACE=1 is explicitly set
+         * (for benchmark debugging). Output goes to stderr so it doesn't clutter
+         * the parsed portion of --bench output. */
+        if (verbose || getenv("KSIEVE_PASS_TRACE")) {
             fprintf(stderr, "[ksieve] n_words=%d, %d pass(es):",
                     fctx.n_words, n_passes);
             for (int i = 0; i <= n_passes; i++)
@@ -3221,6 +3492,70 @@ no_work:
     return res;
 }
 
+/* ksieve_factor: public entry point. Wraps ksieve_factor_single with retry
+ * logic for AUTO/RSA modes when N mod 6 = 1 leaves the factor class ambiguous
+ * (could be (-1,-1) → S-sieve or (+1,+1) → T-sieve).
+ *
+ * Strategy: call ksieve_factor_single once as normal. If it was running S-sieve
+ * under AUTO/RSA and exhausted the scan without finding the factor, retry with
+ * T-sieve. Trials with explicit KSIEVE_SSIEVE=1 or KSIEVE_TSIEVE=1 receive no
+ * retry — the caller chose. Explicit KSIEVE_MSIEVE=1 and default (K-sieve) also
+ * get no retry (K-sieve already handles both old-form classes; M-sieve's class
+ * is unambiguous from N mod 6 = 5).
+ *
+ * Timing: the returned Res accumulates time across both passes. t_total and
+ * n_crt_ops sum; n_isqrt sums; K_bits and np reflect the final pass. */
+Res ksieve_factor(const mpz_t N, mpz_t uo, mpz_t vo, int verbose) {
+    Res r = ksieve_factor_single(N, uo, vo, verbose);
+    if (r.success) return r;
+
+    /* Determine whether this call was eligible for the S→T fallback. */
+    int eligible = 0;
+    {
+        const char *env_a = getenv("KSIEVE_AUTO");
+        const char *env_r = getenv("KSIEVE_RSA");
+        int auto_mode = (env_a && atoi(env_a));
+        int rsa_mode  = (env_r && atoi(env_r));
+        unsigned long N_mod6 = mpz_fdiv_ui(N, 6);
+        /* Under AUTO/RSA with N ≡ 1 mod 6, the first pass ran S-sieve; we can
+         * still retry with T-sieve. Skip if the retry flag is already set (we're
+         * already on the retry pass — don't recurse). */
+        const char *env_retry = getenv("KSIEVE_RETRY_AS_T");
+        int already_retrying = (env_retry && atoi(env_retry));
+        if ((auto_mode || rsa_mode) && N_mod6 == 1 && !already_retrying) {
+            eligible = 1;
+        }
+    }
+
+    if (!eligible) return r;
+
+    if (verbose) {
+        fprintf(stderr, "S-sieve exhausted without finding factor; retrying with T-sieve "
+                        "(factors likely ≡ +1 mod 6).\n");
+    }
+
+    /* Set the retry flag, run again, restore the flag. */
+    const char *prev = getenv("KSIEVE_RETRY_AS_T");
+    char prev_buf[32] = {0};
+    if (prev) { strncpy(prev_buf, prev, sizeof(prev_buf) - 1); }
+    setenv("KSIEVE_RETRY_AS_T", "1", 1);
+
+    Res r2 = ksieve_factor_single(N, uo, vo, verbose);
+
+    if (prev) setenv("KSIEVE_RETRY_AS_T", prev_buf, 1);
+    else      unsetenv("KSIEVE_RETRY_AS_T");
+
+    /* Accumulate counters across both passes. */
+    r2.t_total    += r.t_total;
+    r2.t_precomp  += r.t_precomp;
+    r2.t_p1       += r.t_p1;
+    r2.t_p2       += r.t_p2;
+    r2.n_crt_ops  += r.n_crt_ops;
+    r2.n_k0s      += r.n_k0s;
+    r2.n_isqrt    += r.n_isqrt;
+    return r2;
+}
+
 /* ══════════════════════════════════════════════════════════════════════════
  * UTILITIES
  * ══════════════════════════════════════════════════════════════════════════ */
@@ -3310,20 +3645,52 @@ static void gen_semiprime_newform(mpz_t N, mpz_t u, mpz_t v,
     }
 }
 
+/* Generate a (+1,+1)-FORM semiprime: N = u*v with u ≡ 1 (mod 6), v ≡ 1 (mod 6).
+ * Produces N ≡ 1 (mod 6), the target for T-sieve. Both primes are balanced
+ * (~bits/2 each), matching gen_semiprime's structure for S/K-sieve. */
+static void gen_semiprime_tform(mpz_t N, mpz_t u, mpz_t v,
+                                int bits, gmp_randstate_t rng) {
+    int half = bits / 2;
+    for (;;) {
+        /* u ≡ 1 (mod 6) */
+        mpz_urandomb(u, rng, half);
+        mpz_setbit(u, half - 1);
+        mpz_setbit(u, half - 2);
+        {
+            long adj = ((long)(1 - mpz_fdiv_ui(u, 6)) % 6 + 6) % 6;
+            mpz_add_ui(u, u, (unsigned long)adj);
+        }
+        if (!mpz_probab_prime_p(u, 20)) continue;
+
+        /* v ≡ 1 (mod 6) */
+        mpz_urandomb(v, rng, bits - half);
+        mpz_setbit(v, bits - half - 1);
+        {
+            long adj = ((long)(1 - mpz_fdiv_ui(v, 6)) % 6 + 6) % 6;
+            mpz_add_ui(v, v, (unsigned long)adj);
+        }
+        if (mpz_cmp(v, u) <= 0) continue;
+        if (!mpz_probab_prime_p(v, 20)) continue;
+
+        mpz_mul(N, u, v);
+        int nb = (int)mpz_sizeinbase(N, 2);
+        if (nb == bits || nb == bits - 1) break;
+    }
+}
+
 /* Generate an RSA-STYLE semiprime: N = u*v where u and v are both balanced primes
  * of bits/2 bits each, with NO constraint on their residue mod 6. Standard RSA
  * keygen follows this pattern (modulo additional safe-prime / strong-prime
  * requirements that are orthogonal to this algorithm's behavior).
  *
- * Of the three possible (u mod 6, v mod 6) combinations for primes > 3:
- *   (5, 5)  →  N ≡ 1 (mod 6)  →  S-sieve can factor this
- *   (1, 1)  →  N ≡ 1 (mod 6)  →  NEITHER sieve handles this (both factors ≡ 1)
- *   (1, 5) or (5, 1)  →  N ≡ 5 (mod 6)  →  M-sieve can factor this
+ * With the addition of T-sieve in Rev. 8, all four pairings of prime residues
+ * mod 6 are now factorable:
+ *   (5, 5) →  N ≡ 1 (mod 6)  →  S-sieve  (u ≡ v ≡ -1 mod 6)
+ *   (1, 1) →  N ≡ 1 (mod 6)  →  T-sieve  (u ≡ v ≡ +1 mod 6)
+ *   (1, 5) or (5, 1)  →  N ≡ 5 (mod 6)  →  M-sieve  (mixed)
  *
- * The (1, 1) case occurs ~25% of the time with truly random primes and is
- * not solvable by any sieve in this family. This function rejects and resamples
- * those cases (reporting counts via *n_rejected_1_1 if non-NULL), so the
- * generator output is always factorable by auto-mode.
+ * Previously the (1,1) case was rejected (and counted in *n_rejected_1_1).
+ * The parameter is kept for API compatibility but is no longer incremented.
  *
  * Also enforces |u - v| > 2^(bits/4) to keep Fermat factorization from
  * trivially solving the instance (matches standard RSA key-gen guidance). */
@@ -3336,6 +3703,7 @@ static void gen_semiprime_rsa(mpz_t N, mpz_t u, mpz_t v,
     /* Minimum factor difference: 2^(bits/4). Prevents trivial Fermat case. */
     mpz_set_ui(min_diff, 1);
     mpz_mul_2exp(min_diff, min_diff, bits / 4);
+    (void)n_rejected_1_1;  /* kept for API compat; no longer used */
 
     for (;;) {
         /* Random prime u of ~half bits. No mod-6 constraint. */
@@ -3363,16 +3731,12 @@ static void gen_semiprime_rsa(mpz_t N, mpz_t u, mpz_t v,
         mpz_sub(diff, v, u);
         if (mpz_cmp(diff, min_diff) < 0) continue;
 
-        /* Check N mod 6 structure. Both primes ≡ 1 (mod 6) means N ≡ 1 but
-         * neither sieve handles it; resample. */
-        unsigned long u6 = mpz_fdiv_ui(u, 6);
-        unsigned long v6 = mpz_fdiv_ui(v, 6);
-        if (u6 == 1 && v6 == 1) {
-            if (n_rejected_1_1) (*n_rejected_1_1)++;
-            continue;
-        }
-        /* (u6 == 5 && v6 == 5): N ≡ 1 (mod 6), S-sieve handles it.
-         * (u6 == 1 && v6 == 5) or (5 && 1): N ≡ 5 (mod 6), M-sieve handles it. */
+        /* All four mod-6 pairings are now solvable:
+         *   (5, 5):   S-sieve
+         *   (1, 1):   T-sieve  (NEW in Rev. 8)
+         *   (1, 5) / (5, 1): M-sieve
+         * No rejections needed. AUTO/RSA dispatch handles (-1,-1) via S-sieve
+         * first with T-sieve fallback. */
 
         mpz_mul(N, u, v);
         int nb = (int)mpz_sizeinbase(N, 2);
@@ -3389,6 +3753,7 @@ static void run_demo(void) {
     printf("  K-Sieve  --  CRT Enumeration  (up to ~100-bit N)\n");
     printf("=============================================================\n\n");
     printf("  K-Sieve / S-Sieve: factors N = u*v with u == v == 5 (mod 6).\n");
+    printf("  T-Sieve          : factors N = u*v with u == v == 1 (mod 6).\n");
     printf("  M-Sieve (new form): factors N = u*v with u == 5, v == 1 (mod 6).\n");
     printf("  Phase 1: density-sorted CRT DFS enumeration.\n");
     printf("  Phase 2: stride scan + native-u128 or GMP isqrt.\n\n");
@@ -3404,6 +3769,21 @@ static void run_demo(void) {
         {"80-bit", "891800461426303612800523",         "857229368789",    "1040328871007"},
         {"90-bit", "816622855523043691765836997",      "26697544623989",  "30587938592273"},
         {"100-bit","771506244974010922570371819361",   "742710680628167", "1038770903794583"},
+        {NULL, NULL, NULL, NULL}
+    };
+
+    /* ── (+1,+1)-form (T-sieve) test vectors.
+     * u ≡ v ≡ 1 (mod 6), both prime, N ≡ 1 (mod 6). Balanced (|v-u| < sqrt(N)).
+     * All verified to factor under KSIEVE_TSIEVE=1 with isqrt=1. */
+    static const struct { const char *lbl, *N, *u, *v; } ex_pp[] = {
+        {"40-bit", "665040100429",                     "713917",          "931537"},
+        {"48-bit", "149199193840561",                   "11454997",        "13024813"},
+        {"56-bit", "42144155027147659",                 "169526449",       "248599291"},
+        {"64-bit", "11090740812408591721",              "3056443669",      "3628642309"},
+        {"72-bit", "3129356017880881504141",            "47688019009",     "65621430349"},
+        {"80-bit", "1154030871937177737657607",         "1054496698603",   "1094390218069"},
+        {"90-bit", "688281468638895108610922467",       "19689511327957",  "34956757289431"},
+        {"100-bit","646720424990238150458269230523",    "582628581126019", "1110004634067817"},
         {NULL, NULL, NULL, NULL}
     };
 
@@ -3435,6 +3815,30 @@ static void run_demo(void) {
         print_res(&r, ok);
         putchar('\n');
     }
+
+    /* T-sieve demo: temporarily set KSIEVE_TSIEVE=1 so ksieve_factor dispatches to T-sieve.
+     * Save/restore the caller's environment so --demo leaves no side effects. */
+    printf(">>> (+1,+1) FORM (T-sieve, auto-enabled for this section)\n\n");
+    const char *prev_t = getenv("KSIEVE_TSIEVE");
+    char prev_t_buf[64] = {0};
+    if (prev_t) {
+        strncpy(prev_t_buf, prev_t, sizeof(prev_t_buf) - 1);
+    }
+    setenv("KSIEVE_TSIEVE", "1", 1);
+
+    for (int i = 0; ex_pp[i].lbl; i++) {
+        printf("--- %s ---\n", ex_pp[i].lbl);
+        mpz_set_str(N, ex_pp[i].N, 10);
+        print_mpz_short("  N", N);
+        Res r = ksieve_factor(N, u, v, 0);
+        int ok = r.success && verify(N, u, v);
+        if (ok) { print_mpz_short("  u", u); print_mpz_short("  v", v); }
+        print_res(&r, ok);
+        putchar('\n');
+    }
+
+    if (prev_t) setenv("KSIEVE_TSIEVE", prev_t_buf, 1);
+    else        unsetenv("KSIEVE_TSIEVE");
 
     /* M-sieve demo: temporarily set KSIEVE_MSIEVE=1 so ksieve_factor dispatches to M-sieve.
      * Save/restore the caller's environment so --demo leaves no side effects. */
@@ -3529,12 +3933,14 @@ static void run_bench_instr(int bits, int trials) {
     double sum_total = 0;
     int n_ok = 0;
 
-    int gen_mode_instr = 0;  /* 0 = old-form, 1 = new-form, 2 = RSA-style */
+    int gen_mode_instr = 0;  /* 0 = old-form, 1 = new-form, 2 = RSA-style, 3 = (+1,+1)-form */
     {
         const char *env_m = getenv("KSIEVE_MSIEVE");
+        const char *env_t = getenv("KSIEVE_TSIEVE");
         const char *env_r = getenv("KSIEVE_RSA");
         if (env_r && atoi(env_r)) gen_mode_instr = 2;
         else if (env_m && atoi(env_m)) gen_mode_instr = 1;
+        else if (env_t && atoi(env_t)) gen_mode_instr = 3;
     }
     /* Note: in RSA mode, ksieve_factor auto-selects sieve per N based on the
      * KSIEVE_RSA env var; no additional setup is needed here. */
@@ -3543,6 +3949,7 @@ static void run_bench_instr(int bits, int trials) {
     for (int t = 0; t < trials; t++) {
         if (gen_mode_instr == 2)      gen_semiprime_rsa(N, ug, vg, bits, rng, &n_rsa_rejected_instr);
         else if (gen_mode_instr == 1) gen_semiprime_newform(N, ug, vg, bits, rng);
+        else if (gen_mode_instr == 3) gen_semiprime_tform(N, ug, vg, bits, rng);
         else                          gen_semiprime(N, ug, vg, bits, rng);
         Res r = ksieve_factor(N, u, v, 0);
         int ok = r.success && verify(N, u, v);
@@ -3585,19 +3992,23 @@ static void run_bench(int bits, int trials) {
      *   KSIEVE_RSA=1    → RSA-style (balanced primes, no mod-6 constraint).
      *                      Auto-select sieve per-N based on N mod 6.
      *   KSIEVE_MSIEVE=1 → new-form generator (N ≡ 5 mod 6).
-     *   otherwise       → old-form generator (N ≡ 1 mod 6). */
-    int gen_mode = 0;   /* 0 = old-form, 1 = new-form, 2 = RSA-style */
+     *   KSIEVE_TSIEVE=1 → (+1,+1)-form generator (N ≡ 1 mod 6, u,v ≡ +1 mod 6).
+     *   otherwise       → old-form generator (N ≡ 1 mod 6, u,v ≡ -1 mod 6). */
+    int gen_mode = 0;   /* 0 = old-form, 1 = new-form, 2 = RSA-style, 3 = (+1,+1)-form */
     {
         const char *env_m = getenv("KSIEVE_MSIEVE");
+        const char *env_t = getenv("KSIEVE_TSIEVE");
         const char *env_r = getenv("KSIEVE_RSA");
         if (env_r && atoi(env_r)) gen_mode = 2;
         else if (env_m && atoi(env_m)) gen_mode = 1;
+        else if (env_t && atoi(env_t)) gen_mode = 3;
     }
     long n_rsa_rejected_1_1 = 0;
     for (int t = 0; t < trials; t++) {
         mpz_init(Ns[t]);
         if (gen_mode == 2)      gen_semiprime_rsa(Ns[t], ug, vg, bits, rng, &n_rsa_rejected_1_1);
         else if (gen_mode == 1) gen_semiprime_newform(Ns[t], ug, vg, bits, rng);
+        else if (gen_mode == 3) gen_semiprime_tform(Ns[t], ug, vg, bits, rng);
         else                    gen_semiprime(Ns[t], ug, vg, bits, rng);
     }
     mpz_clears(ug, vg, NULL);
@@ -3609,22 +4020,27 @@ static void run_bench(int bits, int trials) {
          * if the user also set an explicit sieve flag — RSA takes precedence. */
         const char *env_m_warn = getenv("KSIEVE_MSIEVE");
         const char *env_s_warn = getenv("KSIEVE_SSIEVE");
+        const char *env_t_warn = getenv("KSIEVE_TSIEVE");
         int has_m = (env_m_warn && atoi(env_m_warn));
         int has_s = (env_s_warn && atoi(env_s_warn));
-        if (has_m || has_s) {
+        int has_t = (env_t_warn && atoi(env_t_warn));
+        if (has_m || has_s || has_t) {
             fprintf(stderr,
-                "WARNING: KSIEVE_RSA=1 is set together with KSIEVE_%sSIEVE=1; "
+                "WARNING: KSIEVE_RSA=1 is set together with KSIEVE_%cSIEVE=1; "
                 "RSA mode overrides the explicit sieve choice and auto-selects "
-                "per N based on N mod 6.\n\n",
-                has_m ? "M" : "S");
+                "per N based on N mod 6 (with S→T retry for N ≡ 1 mod 6).\n\n",
+                has_m ? 'M' : (has_s ? 'S' : 'T'));
         }
-        long total_draws = (long)trials + n_rsa_rejected_1_1;
-        printf("[RSA mode] generated %d usable semiprimes; rejected %ld draws "
-               "where both primes ≡ 1 mod 6 (%.1f%% of %ld total draws; "
-               "theoretical expectation ~25%% for uniform random primes)\n\n",
-               trials, n_rsa_rejected_1_1,
-               total_draws > 0 ? (100.0 * n_rsa_rejected_1_1 / total_draws) : 0.0,
-               total_draws);
+        /* Rev. 8: T-sieve now handles the (1,1) class; no draws are rejected.
+         * n_rsa_rejected_1_1 stays 0 and the count-line is suppressed. */
+        if (n_rsa_rejected_1_1 > 0) {
+            long total_draws = (long)trials + n_rsa_rejected_1_1;
+            printf("[RSA mode] rejected %ld / %ld draws (unexpected in Rev. 8+)\n\n",
+                   n_rsa_rejected_1_1, total_draws);
+        } else {
+            printf("[RSA mode] all %d draws usable (Rev. 8: T-sieve handles (+1,+1) class;"
+                   " the AUTO/RSA dispatcher retries S→T on N ≡ 1 mod 6)\n\n", trials);
+        }
     }
 
     printf("%-4s  %-6s  %-4s  %-10s  %-10s  %-9s  %-10s  %-10s  %s\n",
@@ -3765,24 +4181,27 @@ static void run_factor(const char *s) {
     }
     {
         /* Warn if N mod 6 doesn't match the selected mode.
-         * K/S-sieve require N ≡ 1 (mod 6); M-sieve requires N ≡ 5 (mod 6). */
+         * K/S/T-sieve require N ≡ 1 (mod 6); M-sieve requires N ≡ 5 (mod 6). */
         unsigned long nm6 = mpz_fdiv_ui(N, 6);
         const char *env_m = getenv("KSIEVE_MSIEVE");
         const char *env_s = getenv("KSIEVE_SSIEVE");
+        const char *env_t = getenv("KSIEVE_TSIEVE");
         const char *env_a = getenv("KSIEVE_AUTO");
         int explicit_m = (env_m && atoi(env_m));
         int explicit_s = (env_s && atoi(env_s));
+        int explicit_t = (env_t && atoi(env_t));
         int auto_mode  = (env_a && atoi(env_a));
         int expect_new = explicit_m || (auto_mode && nm6 == 5);
-        int expect_old = explicit_s || (!explicit_m && !auto_mode);
+        int expect_old = explicit_s || explicit_t ||
+                         (!explicit_m && !auto_mode);
         if (expect_new && nm6 != 5) {
             fprintf(stderr,
                 "Warning: N == %lu (mod 6); M-sieve requires N == 5 (mod 6)\n"
                 "  (factors must be primes of form (6k-1) and (6k+1))\n", nm6);
         } else if (expect_old && nm6 != 1) {
             fprintf(stderr,
-                "Warning: N == %lu (mod 6); K/S-sieve requires N == 1 (mod 6)\n"
-                "  (both factors must be primes of the form 6k-1)\n"
+                "Warning: N == %lu (mod 6); K/S/T-sieve require N == 1 (mod 6)\n"
+                "  (both factors must be primes of the form 6k-1 or both 6k+1)\n"
                 "  Set KSIEVE_MSIEVE=1 (or KSIEVE_AUTO=1) for N == 5 (mod 6).\n", nm6);
         }
     }
@@ -3800,7 +4219,7 @@ static void run_factor(const char *s) {
     int ok = r.success && verify(N, u, v);
     if (ok) { printf("Factored!\n"); print_mpz_short("  u", u); print_mpz_short("  v", v); }
     else if (r.success) printf("Internal error: result fails verification.\n");
-    else printf("Not found. Verify both factors are == 5 (mod 6).\n");
+    else printf("Not found. Check that both factors are primes ≡ ±1 mod 6 matching the selected sieve.\n");
     print_res(&r, ok);
 
     mpz_clears(N, u, v, NULL);
@@ -3827,10 +4246,18 @@ int main(int argc, char *argv[]) {
         run_info();
     } else if (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h")) {
         printf("Usage:\n");
-        printf("  %s <N>               Factor decimal N (u,v must be == 5 mod 6)\n", argv[0]);
-        printf("  %s --demo            Examples from 40-100 bit\n", argv[0]);
+        printf("  %s <N>               Factor decimal N (auto picks sieve with KSIEVE_AUTO=1)\n", argv[0]);
+        printf("  %s --demo            Examples from 40-100 bit (K/S/M/T-sieves)\n", argv[0]);
         printf("  %s --bench <b> <n>   Benchmark n random b-bit semiprimes\n", argv[0]);
         printf("  %s --info            Performance profile table\n", argv[0]);
+        printf("\nEnvironment flags (sieve selection, precedence: RSA > M > S > T > AUTO > default):\n");
+        printf("  KSIEVE_AUTO=1    Auto-select per N. N mod 6 = 5 → M-sieve; N mod 6 = 1 → S-sieve\n");
+        printf("                   with T-sieve fallback if S-sieve exhausts (factors ≡ +1 mod 6).\n");
+        printf("  KSIEVE_RSA=1    RSA-style bench: balanced primes, auto-select per N.\n");
+        printf("  KSIEVE_SSIEVE=1 Force S-sieve (u,v ≡ -1 mod 6, N ≡ 1 mod 6). 4.24× faster than K-sieve.\n");
+        printf("  KSIEVE_TSIEVE=1 Force T-sieve (u,v ≡ +1 mod 6, N ≡ 1 mod 6). 4.24× faster than K-sieve.\n");
+        printf("  KSIEVE_MSIEVE=1 Force M-sieve (u ≡ -1, v ≡ +1 mod 6, N ≡ 5 mod 6).\n");
+        printf("  (no flag set)   K-sieve (old form, handles both (-1,-1) and (+1,+1) classes slowly).\n");
     } else {
         run_factor(argv[1]);
     }

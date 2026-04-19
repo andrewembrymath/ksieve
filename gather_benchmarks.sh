@@ -8,9 +8,11 @@
 #   1. Builds binaries for 1-thread and 16-thread variants (from the SAME source)
 #   2. Runs M-sieve scaling sweep (60..110 bit, 30 trials each, 16-thread)
 #   3. Runs S-sieve scaling sweep (80..120 bit, 30 trials each, 16-thread)
-#   4. Runs paired K vs S vs M comparison at 100-bit (30 trials each)
-#   5. Runs single-thread vs 16-thread comparison for M-sieve at 100-bit
-#   6. Runs BS_NP tuning sweep at 90-bit (reproduces Rev. 5 result)
+#   4. Runs T-sieve scaling sweep (80..120 bit, 30 trials each, 16-thread)  [Rev. 8+]
+#   5. Runs K-sieve scaling sweep (80..100 bit, 30 trials each, 16-thread)
+#   6. Runs paired K vs S vs T vs M comparison at 100-bit (30 trials each)
+#   7. Runs single-thread vs 16-thread comparison for M-sieve at 100-bit
+#   8. Runs BS_NP tuning sweep at 90-bit (reproduces Rev. 5 result)
 #
 # Output:
 #   - Raw per-trial logs in $OUT/logs/*.log (one file per run)
@@ -21,9 +23,10 @@
 # Resumable: if killed, re-running will skip any run whose log already exists
 # with a "--- Summary" line (meaning it completed).
 #
-# Expected wall time on 16-core 3GHz+ machine: 8-12 hours total.
-#   Most of it is the S-sieve 120-bit cell (~90s/trial × 30 = ~45 min)
-#   and M-sieve 110-bit (~30 min × 30 trials could be 6+ hours worst case).
+# Expected wall time on 16-core 3GHz+ machine: 10-14 hours total (Rev. 8).
+#   Most of it is the two 120-bit cells (S-sieve and T-sieve, each ~45 min at
+#   ~90s/trial × 30 trials) plus M-sieve 110-bit (6+ hours worst case).
+#   Adding T-sieve roughly doubles the S-sieve section's wall time.
 # You can kill and resume at any time.
 #
 # Usage:
@@ -58,6 +61,18 @@ M_SIEVE_GRID=(
 )
 
 S_SIEVE_GRID=(
+    "80 30 30"
+    "90 30 60"
+    "100 30 300"
+    "110 30 1800"
+    "120 20 7200"
+)
+
+# T-sieve grid mirrors S-sieve grid. Both have identical search range,
+# root modulus density (1/6 or 1/12), discriminant (36N), and filter chain;
+# expected performance parity with S-sieve at each bit size. Running the same
+# grid gives a direct apples-to-apples comparison for the paper.
+T_SIEVE_GRID=(
     "80 30 30"
     "90 30 60"
     "100 30 300"
@@ -240,8 +255,18 @@ if [[ ! -f "$OUT_DIR/.done.scaling-S" ]]; then
     touch "$OUT_DIR/.done.scaling-S"
 fi
 
-# ---------- SECTION 3: K-sieve scaling (smaller range, reference only) ----------
-banner "SECTION 3: K-sieve scaling (reference, 16-thread)"
+# ---------- SECTION 3: T-sieve scaling (Rev. 8+, (+1,+1) form) ----------
+banner "SECTION 3: T-sieve scaling ((+1,+1)-form, 16-thread)"
+if [[ ! -f "$OUT_DIR/.done.scaling-T" ]]; then
+    for row in "${T_SIEVE_GRID[@]}"; do
+        read -r bits trials _timeout <<< "$row"
+        run_bench "scale-T-${bits}b" "T" "$bits" "$trials" 16 "KSIEVE_TSIEVE=1" || true
+    done
+    touch "$OUT_DIR/.done.scaling-T"
+fi
+
+# ---------- SECTION 4: K-sieve scaling (smaller range, reference only) ----------
+banner "SECTION 4: K-sieve scaling (reference, 16-thread)"
 if [[ ! -f "$OUT_DIR/.done.scaling-K" ]]; then
     for row in "${K_SIEVE_GRID[@]}"; do
         read -r bits trials _timeout <<< "$row"
@@ -250,20 +275,22 @@ if [[ ! -f "$OUT_DIR/.done.scaling-K" ]]; then
     touch "$OUT_DIR/.done.scaling-K"
 fi
 
-# ---------- SECTION 4: K/S/M paired comparison at PAIRED_BITS ----------
-banner "SECTION 4: K/S/M paired @ ${PAIRED_BITS}-bit (16-thread, $PAIRED_TRIALS trials each)"
+# ---------- SECTION 5: K/S/T/M paired comparison at PAIRED_BITS ----------
+banner "SECTION 5: K/S/T/M paired @ ${PAIRED_BITS}-bit (16-thread, $PAIRED_TRIALS trials each)"
 if [[ ! -f "$OUT_DIR/.done.paired" ]]; then
-    # NOTE: these run on different RNG seed streams because gen_semiprime vs
-    # gen_semiprime_newform use distinct generators; 30 trials each is enough
-    # to stabilize the mean.
+    # NOTE: these run on different RNG seed streams because each generator
+    # (gen_semiprime, gen_semiprime_tform, gen_semiprime_newform) uses a
+    # distinct residue-class filter; 30 trials each stabilizes the mean.
+    # K-sieve draws old-form (-1,-1) semiprimes by default, same as S-sieve.
     run_bench "paired-K-${PAIRED_BITS}b" "K" "$PAIRED_BITS" "$PAIRED_TRIALS" 16 ""                  || true
     run_bench "paired-S-${PAIRED_BITS}b" "S" "$PAIRED_BITS" "$PAIRED_TRIALS" 16 "KSIEVE_SSIEVE=1"   || true
+    run_bench "paired-T-${PAIRED_BITS}b" "T" "$PAIRED_BITS" "$PAIRED_TRIALS" 16 "KSIEVE_TSIEVE=1"   || true
     run_bench "paired-M-${PAIRED_BITS}b" "M" "$PAIRED_BITS" "$PAIRED_TRIALS" 16 "KSIEVE_MSIEVE=1"   || true
     touch "$OUT_DIR/.done.paired"
 fi
 
-# ---------- SECTION 5: single-thread vs 16-thread at THREADING_BITS ----------
-banner "SECTION 5: threading scan — M-sieve ${THREADING_BITS}-bit, $THREADING_TRIALS trials"
+# ---------- SECTION 6: single-thread vs 16-thread at THREADING_BITS ----------
+banner "SECTION 6: threading scan — M-sieve ${THREADING_BITS}-bit, $THREADING_TRIALS trials"
 if [[ ! -f "$OUT_DIR/.done.threads" ]]; then
     for t in "${THREAD_VARIANTS[@]}"; do
         run_bench "thread-M-${THREADING_BITS}b-t${t}" "M" "$THREADING_BITS" "$THREADING_TRIALS" "$t" "KSIEVE_MSIEVE=1" || true
@@ -271,8 +298,8 @@ if [[ ! -f "$OUT_DIR/.done.threads" ]]; then
     touch "$OUT_DIR/.done.threads"
 fi
 
-# ---------- SECTION 6: BS_NP sweep at BSNP_BITS ----------
-banner "SECTION 6: BS_NP sweep — ${BSNP_MODE} ${BSNP_BITS}-bit, $BSNP_TRIALS trials each"
+# ---------- SECTION 7: BS_NP sweep at BSNP_BITS ----------
+banner "SECTION 7: BS_NP sweep — ${BSNP_MODE} ${BSNP_BITS}-bit, $BSNP_TRIALS trials each"
 if [[ ! -f "$OUT_DIR/.done.bsnp" ]]; then
     for np in 8 9 10 11 12 13 14; do
         run_bench "bsnp-${BSNP_MODE}-${BSNP_BITS}b-np${np}" "M" "$BSNP_BITS" "$BSNP_TRIALS" 16 "${BSNP_MODE}=1 KSIEVE_BS_NP=$np" || true
@@ -331,14 +358,38 @@ def scaling_section(title, prefix_keys):
 
 out.append(scaling_section("Scaling — M-sieve (16-thread)", ["scale-M"]))
 out.append(scaling_section("Scaling — S-sieve (16-thread)", ["scale-S"]))
+out.append(scaling_section("Scaling — T-sieve (16-thread)", ["scale-T"]))
 out.append(scaling_section("Scaling — K-sieve (16-thread, reference)", ["scale-K"]))
 
-# --- Section 4: paired ---
-out.append(f"\n## Paired K / S / M comparison (same bit size, 16-thread)\n")
+# --- Combined S vs T scaling comparison (Rev. 8+) ---
+# S-sieve and T-sieve should have essentially identical performance at matched
+# bit size; this table makes the comparison easy to eyeball.
+st_s = {r['bits']: r for r in rows if r['run_id'].startswith('scale-S-')}
+st_t = {r['bits']: r for r in rows if r['run_id'].startswith('scale-T-')}
+common_bits = sorted(set(st_s.keys()) & set(st_t.keys()), key=int)
+if common_bits:
+    out.append("\n## S-sieve vs T-sieve head-to-head (matched bit size, 16-thread)\n")
+    out.append("| Bits | S mean (s) | T mean (s) | T/S ratio | S OK/Req | T OK/Req |")
+    out.append("|---|---|---|---|---|---|")
+    for b in common_bits:
+        rs, rt = st_s[b], st_t[b]
+        ratio = "—"
+        try:
+            ratio = f"{float(rt['mean_total_s'])/float(rs['mean_total_s']):.2f}×"
+        except Exception:
+            pass
+        out.append(f"| {b} | {fnum(rs['mean_total_s'])} | {fnum(rt['mean_total_s'])} | {ratio} | "
+                   f"{rs['trials_ok']}/{rs['trials_requested']} | "
+                   f"{rt['trials_ok']}/{rt['trials_requested']} |")
+
+# --- Section 5: paired ---
+out.append(f"\n## Paired K / S / T / M comparison (same bit size, 16-thread)\n")
 out.append("| Sieve | Bits | Trials | Mean total (s) | Mean K0s | Mean CRT ops | Ratio vs S |")
 out.append("|---|---|---|---|---|---|---|")
 paired = [r for r in rows if r['run_id'].startswith('paired-')]
-paired.sort(key=lambda r: r['sieve'])
+# Present in canonical order: K (reference), S (-1,-1 old-form), T (+1,+1 old-form), M (new-form)
+order = {'K': 0, 'S': 1, 'T': 2, 'M': 3}
+paired.sort(key=lambda r: order.get(r['sieve'], 99))
 s_mean = None
 for r in paired:
     if r['sieve'] == 'S':
@@ -351,7 +402,7 @@ for r in paired:
         except: pass
     out.append(f"| {r['sieve']} | {r['bits']} | {r['trials_ok']}/{r['trials_requested']} | {fnum(r['mean_total_s'])} | {r['mean_k0s']} | {r['mean_crt_ops']} | {ratio} |")
 
-# --- Section 5: threading ---
+# --- Section 6: threading ---
 out.append(f"\n## Threading scaling — M-sieve\n")
 out.append("| Threads | Bits | Trials | Mean total (s) | Min (s) | Max (s) | Speedup vs 1t |")
 out.append("|---|---|---|---|---|---|---|")
@@ -369,7 +420,7 @@ for r in thread_rows:
         except: pass
     out.append(f"| {r['threads']} | {r['bits']} | {r['trials_ok']}/{r['trials_requested']} | {fnum(r['mean_total_s'])} | {fnum(r['min_s'])} | {fnum(r['max_s'])} | {speedup} |")
 
-# --- Section 6: BS_NP sweep ---
+# --- Section 7: BS_NP sweep ---
 out.append(f"\n## BS_NP sweep (bitset prime count)\n")
 out.append("| BS_NP | Bits | Trials | Mean total (s) | vs default |")
 out.append("|---|---|---|---|---|")
@@ -411,10 +462,12 @@ echo
 echo "To re-run only a specific section, delete the corresponding marker:"
 echo "  rm $OUT_DIR/.done.scaling-M   # M-sieve scaling"
 echo "  rm $OUT_DIR/.done.scaling-S   # S-sieve scaling"
+echo "  rm $OUT_DIR/.done.scaling-T   # T-sieve scaling"
 echo "  rm $OUT_DIR/.done.scaling-K   # K-sieve scaling"
-echo "  rm $OUT_DIR/.done.paired      # K/S/M paired"
+echo "  rm $OUT_DIR/.done.paired      # K/S/T/M paired"
 echo "  rm $OUT_DIR/.done.threads     # threading scan"
 echo "  rm $OUT_DIR/.done.bsnp        # BS_NP sweep"
 echo
 echo "To re-run only specific bit sizes, delete the individual log:"
 echo "  rm $OUT_DIR/logs/scale-M-100b.log"
+echo "  rm $OUT_DIR/logs/scale-T-100b.log"
