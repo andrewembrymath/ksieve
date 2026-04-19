@@ -5,7 +5,7 @@ A specialized integer factoring program for semiprimes `N = u·v` where both pri
 - **K-sieve** and **S-sieve** — factor N ≡ 1 (mod 6), where both factors satisfy p ≡ −1 (mod 6)
 - **M-sieve** — factors N ≡ 5 (mod 6), where one factor is ≡ −1 (mod 6) and the other is ≡ +1 (mod 6)
 
-Together these cover every prime-pair semiprime with factors greater than 3. On a 16-core AVX-512 machine, 100-bit semiprimes factor in roughly 1 second (S-sieve) to 2 seconds (M-sieve); 120-bit in roughly 90 seconds (S-sieve).
+Together these cover every prime-pair semiprime with factors greater than 3. On a 16-thread build, 100-bit semiprimes factor in roughly 0.24 s (S-sieve) to 0.61 s (M-sieve) mean wall-time; 120-bit in roughly 54 s mean (S-sieve).
 
 The sieves share the core mathematical structure of Hittmeir's hyperbolic sieve for Fermat factorization ([arXiv:2205.10074](https://arxiv.org/abs/2205.10074)) — filter candidates by testing whether a specific quadratic polynomial is a residue mod a composite modulus assembled from small primes via CRT — but apply it to the `6n±1` parameterization and add Hensel lifting at p²/p³/p⁴, a tiled 64-bit-word bitset exploiting 2-adic structure, AVX-512 batch-16 acceleration, and multi-threaded prefix work-stealing. See the whitepaper for the full mathematical treatment and benchmarks.
 
@@ -195,17 +195,21 @@ Column glossary:
 
 ## Bit-size expectations
 
-On a 16-core Zen 3 / Alder Lake box with AVX-512:
+## Bit-size expectations
+
+Mean wall-time on a 16-thread build across 30 trials per cell (Rev. 6 benchmarks):
 
 | N bits | K-sieve | S-sieve | M-sieve |
 |---|---|---|---|
-| 80  | ~0.06 s  | ~0.014 s | ~0.018 s |
-| 90  | ~0.7 s   | ~0.05 s  | ~0.11 s  |
-| 100 | ~16 s    | ~1.0 s   | ~2.2 s   |
-| 110 | ~40 s    | ~11 s    | ~25 s    |
-| 120 | ~40 min  | ~90 s    | ~3 min   |
+| 80  | 0.012 s  | 0.002 s  | 0.002 s  |
+| 90  | 0.248 s  | 0.012 s  | 0.021 s  |
+| 100 | 4.781 s  | 0.237 s  | 0.455 s  |
+| 110 | —        | 2.724 s  | 9.803 s  |
+| 120 | —        | 54.0 s   | —        |
 
-Variance across random semiprimes at fixed bit size is high (10–20× is normal) due to factor-balance and DFS ordering effects. Means stabilize with 20–30 trials.
+Variance across random semiprimes at fixed bit size is high (10–60× min-to-max spread at 100-bit+, driven by factor-balance and DFS ordering effects). Means stabilize with 20–30 trials. At 100-bit, the S-sieve's single-trial range was 0.016 s to 0.794 s; the M-sieve's was 0.022 s to 1.168 s.
+
+Single-thread performance at 100-bit: M-sieve mean 4.83 s (7.5× slower than 16-thread). Multi-threaded speedup is sub-linear due to memory-bandwidth saturation in the bitset scan and early-termination tail effects; see the whitepaper §5.5.
 
 ---
 
